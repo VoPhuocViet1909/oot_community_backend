@@ -1,54 +1,39 @@
-const { ddbDocClient } = require('../../config/awsConfig');
-const { ScanCommand, GetCommand } = require('@aws-sdk/lib-dynamodb');
-
-// Bảng kênh trong DynamoDB (primary key: channelId (S))
-const CHANNELS_TABLE = process.env.DDB_CHANNELS_TABLE || 'ott_channels';
+const { pool } = require('../../config/mysqlConfig');
 
 async function getChannelsByGroup(groupId) {
   const groupKey = String(groupId);
 
-  const result = await ddbDocClient.send(new ScanCommand({
-    TableName: CHANNELS_TABLE,
-    FilterExpression: '#gid = :gid',
-    ExpressionAttributeNames: { '#gid': 'groupId' },
-    ExpressionAttributeValues: { ':gid': groupKey }
-  }));
+  const [rows] = await pool.query('SELECT * FROM channels WHERE group_id = ?', [groupKey]);
 
-  const rows = (result.Items || []).sort((a, b) => {
-    const aTime = a.created_at || a.createdAt || '';
-    const bTime = b.created_at || b.createdAt || '';
+  const sorted = rows.slice().sort((a, b) => {
+    const aTime = a.created_at || '';
+    const bTime = b.created_at || '';
     return aTime.localeCompare(bTime);
   });
 
-  return rows.map((row) => ({
-    id: row.channelId,
-    groupId: row.groupId,
+  return sorted.map((row) => ({
+    id: row.channel_id,
+    groupId: row.group_id,
     name: row.name,
     type: row.type,
-    lastMessageId: row.last_messageId || row.last_message_id,
-    createdAt: row.created_at || row.createdAt
+    lastMessageId: row.last_message_id,
+    createdAt: row.created_at
   }));
 }
 
 async function getChannelById(channelId) {
-  const result = await ddbDocClient.send(new ScanCommand({
-    TableName: CHANNELS_TABLE,
-    FilterExpression: '#cid = :cid',
-    ExpressionAttributeNames: { '#cid': 'channelId' },
-    ExpressionAttributeValues: { ':cid': String(channelId) }
-  }));
+  const [rows] = await pool.query('SELECT * FROM channels WHERE channel_id = ? LIMIT 1', [String(channelId)]);
 
-  const rows = result.Items || [];
-  if (!rows.length) return null;
   const row = rows[0];
+  if (!row) return null;
 
   return {
-    id: row.channelId,
-    groupId: row.groupId,
+    id: row.channel_id,
+    groupId: row.group_id,
     name: row.name,
     type: row.type,
-    lastMessageId: row.last_messageId || row.last_message_id,
-    createdAt: row.created_at || row.createdAt
+    lastMessageId: row.last_message_id,
+    createdAt: row.created_at
   };
 }
 

@@ -1,9 +1,7 @@
 const { randomUUID } = require('crypto');
-const { ddbDocClient } = require('../../config/awsConfig');
-const { GetCommand, ScanCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+const { pool } = require('../../config/mysqlConfig');
 const bcrypt = require('bcryptjs');
 
-const USERS_TABLE = process.env.DDB_USERS_TABLE || 'ott_users';
 const OTP_TTL_MS = Number(process.env.OTP_TTL_MS || 5 * 60 * 1000);
 const OTP_SEND_COOLDOWN_MS = Number(process.env.OTP_SEND_COOLDOWN_MS || 60 * 1000);
 const OTP_SEND_WINDOW_MS = Number(process.env.OTP_SEND_WINDOW_MS || 10 * 60 * 1000);
@@ -72,7 +70,7 @@ function getOtpMinutes() {
 function normalizePhoneForTwilio(phone) {
   const raw = String(phone || '')
     .normalize('NFKC')
-    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[​-‍﻿]/g, '')
     .trim();
 
   const compact = raw.replace(/\s+/g, '');
@@ -190,6 +188,242 @@ function saveRecoverySession(session) {
   recoveryStore.set(session.token, session);
 }
 
+/* ─── row <-> app object mapping ─────────────────────────────────────────── */
+
+function mapUserRow(row) {
+  if (!row) return null;
+  return {
+    userId: row.user_id,
+    id: row.id,
+    username: row.username,
+    password_hash: row.password_hash,
+    email: row.email,
+    phone_number: row.phone_number,
+    display_name: row.display_name,
+    avatar_url: row.avatar_url,
+    coverImage: row.cover_image,
+    email_verified: !!row.email_verified,
+    phone_verified: !!row.phone_verified,
+    status: row.status,
+    fcm_tokens: row.fcm_tokens || [],
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+/* ─── core lookups ────────────────────────────────────────────────────────── */
+
+async function getUserRowById(userId) {
+  if (!userId) return null;
+
+  const keyUserId = String(userId);
+  const numericId = Number(userId);
+  const hasNumericId = !Number.isNaN(numericId);
+
+  const [rows] = await pool.query(
+    hasNumericId
+      ? 'SELECT * FROM users WHERE user_id = ? OR id = ? LIMIT 1'
+      : 'SELECT * FROM users WHERE user_id = ? LIMIT 1',
+    hasNumericId ? [keyUserId, numericId] : [keyUserId]
+  );
+
+  return mapUserRow(rows[0]);
+}
+
+async function getUserById(userId) {
+  const user = await getUserRowById(userId);
+  if (!user) return null;
+  const { password_hash, ...userWithoutPassword } = user;
+  return userWithoutPassword;
+}
+
+async function findUserByIdentifier({ email, phone, username }) {
+  const [rows] = await pool.query('SELECT * FROM users');
+
+  const targetEmail = email ? normalizeEmailValue(email) : null;
+  const targetPhone = phone ? normalizePhoneValue(phone) : null;
+  const targetUsername = username ? String(username).trim() : null;
+
+  const matched = rows.find((row) => {
+    const itemEmail = normalizeEmailValue(row.email);
+    const itemPhone = normalizePhoneValue(row.phone_number);
+    const itemUsername = String(row.username || '').trim();
+
+    return (
+      (targetEmail && itemEmail === targetEmail) ||
+      (targetPhone && itemPhone === targetPhone) ||
+      (targetUsername && itemUsername === targetUsername)
+    );
+  });
+
+  return matched ? mapUserRow(matched) : null;
+}
+
+async function resolveAuthUser(userId, username) {
+  const byId = await getUserById(userId);
+  if (byId) return byId;
+
+  if (username) {
+    const byUsername = await findUserByIdentifier({ username });
+    if (byUsername) {
+      const { password_hash, ...userWithoutPassword } = byUsername;
+      return userWithoutPassword;
+    }
+  }
+
+  return null;
+}
+
+async function listUsers() {
+  const [rows] = await pool.query('SELECT * FROM users ORDER BY id DESC');
+  return rows.map((row) => {
+    const { password_hash, ...rest } = mapUserRow(row);
+    return rest;
+  });
+}
+
+/* ─── mutations ───────────────────────────────────────────────────────────── */
+
+async function updateProfile(userId, payload) {
+  const user = await getUserRowById(userId);
+  if (!user) {
+    throw new Error('Không tìm thấy tài khoản');
+  }
+
+  const displayName = payload.displayName || payload.fullName || payload.display_name;
+  const email = payload.email;
+  const phone = payload.phone || payload.phoneNumber || payload.phone_number;
+  const avatarUrl = payload.avatarUrl || payload.avatar_url;
+  const coverImage = payload.coverImage || payload.cover_url;
+
+  const setClauses = [];
+  const values = [];
+
+  if (displayName !== undefined) {
+    if (String(displayName).trim().length < 2 || String(displayName).trim().length > 50) {
+      throw new Error('Họ tên phải từ 2-50 ký tự');
+    }
+    setClauses.push('display_name = ?');
+    values.push(String(displayName).trim());
+  }
+
+  if (email !== undefined) {
+    if (String(email).trim() !== '' && !isValidEmail(email)) {
+      throw new Error('Email không hợp lệ');
+    }
+    setClauses.push('email = ?');
+    values.push(String(email || '').trim() || null);
+    setClauses.push('email_verified = ?');
+    values.push(0);
+  }
+
+  if (phone !== undefined) {
+    if (!isValidPhone(phone)) {
+      throw new Error('Số điện thoại không hợp lệ');
+    }
+    setClauses.push('phone_number = ?');
+    values.push(String(phone).trim());
+    setClauses.push('phone_verified = ?');
+    values.push(0);
+  }
+
+  if (avatarUrl !== undefined) {
+    setClauses.push('avatar_url = ?');
+    values.push(String(avatarUrl || '').trim() || null);
+  }
+
+  if (coverImage !== undefined) {
+    setClauses.push('cover_image = ?');
+    values.push(String(coverImage || '').trim() || null);
+  }
+
+  if (setClauses.length === 0) {
+    throw new Error('Không có dữ liệu cần cập nhật');
+  }
+
+  setClauses.push('updated_at = ?');
+  values.push(new Date().toISOString());
+  values.push(user.userId);
+
+  await pool.query(`UPDATE users SET ${setClauses.join(', ')} WHERE user_id = ?`, values);
+
+  return getUserById(user.userId);
+}
+
+async function saveFcmToken(userId, token, platform) {
+  if (!userId || !token) return;
+  const user = await getUserRowById(userId);
+  if (!user) return;
+
+  const currentTokens = Array.isArray(user.fcm_tokens) ? user.fcm_tokens : [];
+  if (!currentTokens.includes(token)) {
+    const updatedTokens = [...currentTokens, token];
+    await pool.query('UPDATE users SET fcm_tokens = ? WHERE user_id = ?', [
+      JSON.stringify(updatedTokens),
+      user.userId,
+    ]);
+  }
+}
+
+async function removeFcmToken(userId, token) {
+  if (!userId || !token) return;
+  const user = await getUserRowById(userId);
+  if (!user) return;
+
+  const currentTokens = Array.isArray(user.fcm_tokens) ? user.fcm_tokens : [];
+  const updatedTokens = currentTokens.filter(t => t !== token);
+
+  if (currentTokens.length !== updatedTokens.length) {
+    await pool.query('UPDATE users SET fcm_tokens = ? WHERE user_id = ?', [
+      JSON.stringify(updatedTokens),
+      user.userId,
+    ]);
+  }
+}
+
+async function changePassword(userId, currentPassword, newPassword, username) {
+  if (!currentPassword || !newPassword) {
+    throw new Error('Thiếu mật khẩu hiện tại hoặc mật khẩu mới');
+  }
+  if (!isStrongPassword(newPassword)) {
+    throw new Error('Mật khẩu mới phải có ít nhất 8 ký tự, gồm chữ hoa, chữ thường và số');
+  }
+
+  const user = await resolveAuthUser(userId, username);
+  if (!user) {
+    throw new Error('Không tìm thấy tài khoản');
+  }
+
+  let rawUser = null;
+  const resolvedUserId = user.userId || userId || user.id;
+  if (resolvedUserId) {
+    rawUser = await getUserRowById(resolvedUserId);
+  }
+
+  if (!rawUser && user.username) {
+    rawUser = await findUserByIdentifier({ username: user.username });
+  }
+
+  if (!rawUser) {
+    throw new Error('Không tìm thấy tài khoản');
+  }
+
+  const matched = await bcrypt.compare(String(currentPassword), String(rawUser.password_hash || ''));
+  if (!matched) {
+    throw new Error('Mật khẩu hiện tại không chính xác');
+  }
+
+  const newHash = await bcrypt.hash(String(newPassword), 10);
+
+  await pool.query('UPDATE users SET password_hash = ?, updated_at = ? WHERE user_id = ?', [
+    newHash,
+    new Date().toISOString(),
+    rawUser.userId,
+  ]);
+}
+
+/* ─── password recovery / OTP ────────────────────────────────────────────── */
+
 async function sendPasswordRecoveryOTP(identifier) {
   const trimmedIdentifier = String(identifier || '').trim();
   if (!trimmedIdentifier) {
@@ -270,35 +504,17 @@ async function verifyPasswordRecoveryOTP(recoveryToken, otp) {
   verifyStoredOTP(session.channel, session.target, otp);
 
   if (session.channel === 'email' && isValidEmail(session.target)) {
-    await ddbDocClient.send(new UpdateCommand({
-      TableName: USERS_TABLE,
-      Key: { userId: String(session.userId) },
-      UpdateExpression: 'SET #email_verified = :email_verified, #updated_at = :updated_at',
-      ExpressionAttributeNames: {
-        '#email_verified': 'email_verified',
-        '#updated_at': 'updated_at',
-      },
-      ExpressionAttributeValues: {
-        ':email_verified': true,
-        ':updated_at': new Date().toISOString(),
-      },
-    }));
+    await pool.query('UPDATE users SET email_verified = 1, updated_at = ? WHERE user_id = ?', [
+      new Date().toISOString(),
+      String(session.userId),
+    ]);
   }
 
   if (session.channel === 'phone' && isValidPhone(session.target)) {
-    await ddbDocClient.send(new UpdateCommand({
-      TableName: USERS_TABLE,
-      Key: { userId: String(session.userId) },
-      UpdateExpression: 'SET #phone_verified = :phone_verified, #updated_at = :updated_at',
-      ExpressionAttributeNames: {
-        '#phone_verified': 'phone_verified',
-        '#updated_at': 'updated_at',
-      },
-      ExpressionAttributeValues: {
-        ':phone_verified': true,
-        ':updated_at': new Date().toISOString(),
-      },
-    }));
+    await pool.query('UPDATE users SET phone_verified = 1, updated_at = ? WHERE user_id = ?', [
+      new Date().toISOString(),
+      String(session.userId),
+    ]);
   }
 
   saveRecoverySession({
@@ -322,19 +538,11 @@ async function resetPasswordWithRecovery(recoveryToken, newPassword) {
   }
 
   const newHash = await bcrypt.hash(String(newPassword), 10);
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: USERS_TABLE,
-    Key: { userId: String(session.userId) },
-    UpdateExpression: 'SET #password_hash = :password_hash, #updated_at = :updated_at',
-    ExpressionAttributeNames: {
-      '#password_hash': 'password_hash',
-      '#updated_at': 'updated_at',
-    },
-    ExpressionAttributeValues: {
-      ':password_hash': newHash,
-      ':updated_at': new Date().toISOString(),
-    },
-  }));
+  await pool.query('UPDATE users SET password_hash = ?, updated_at = ? WHERE user_id = ?', [
+    newHash,
+    new Date().toISOString(),
+    String(session.userId),
+  ]);
 
   recoveryStore.delete(session.token);
 }
@@ -490,261 +698,6 @@ function verifyStoredOTP(type, target, otp) {
   otpStore.delete(key);
 }
 
-async function findUserByIdentifier({ email, phone, username }) {
-  const result = await ddbDocClient.send(new ScanCommand({
-    TableName: USERS_TABLE,
-  }));
-
-  const targetEmail = email ? normalizeEmailValue(email) : null;
-  const targetPhone = phone ? normalizePhoneValue(phone) : null;
-  const targetUsername = username ? String(username).trim() : null;
-
-  const matched = (result.Items || []).find((item) => {
-    const itemEmail = normalizeEmailValue(item.email);
-    const itemPhone = normalizePhoneValue(item.phone_number);
-    const itemUsername = String(item.username || '').trim();
-
-    return (
-      (targetEmail && itemEmail === targetEmail) ||
-      (targetPhone && itemPhone === targetPhone) ||
-      (targetUsername && itemUsername === targetUsername)
-    );
-  });
-
-  return matched || null;
-}
-
-async function resolveAuthUser(userId, username) {
-  const byId = await getUserById(userId);
-  if (byId) return byId;
-
-  if (username) {
-    const byUsername = await findUserByIdentifier({ username });
-    if (byUsername) {
-      const { password_hash, ...userWithoutPassword } = byUsername;
-      return userWithoutPassword;
-    }
-  }
-
-  return null;
-}
-
-async function getUserById(userId) {
-  if (!userId) return null;
-
-  const keyUserId = String(userId);
-  const result = await ddbDocClient.send(new GetCommand({
-    TableName: USERS_TABLE,
-    Key: { userId: keyUserId }
-  }));
-
-  if (result.Item) {
-    const { password_hash, ...userWithoutPassword } = result.Item;
-    return userWithoutPassword;
-  }
-
-  const numericId = Number(userId);
-  if (!Number.isNaN(numericId)) {
-    const scanRes = await ddbDocClient.send(new ScanCommand({
-      TableName: USERS_TABLE,
-      FilterExpression: '#id = :id',
-      ExpressionAttributeNames: { '#id': 'id' },
-      ExpressionAttributeValues: { ':id': numericId }
-    }));
-
-    if (scanRes.Items && scanRes.Items.length > 0) {
-      const { password_hash, ...userWithoutPassword } = scanRes.Items[0];
-      return userWithoutPassword;
-    }
-  }
-
-  return null;
-}
-
-async function listUsers() {
-  const result = await ddbDocClient.send(new ScanCommand({
-    TableName: USERS_TABLE
-  }));
-
-  const items = result.Items || [];
-  return items.map((u) => {
-    const { password_hash, ...rest } = u;
-    return rest;
-  }).sort((a, b) => (b.id || 0) - (a.id || 0));
-}
-
-async function updateProfile(userId, payload) {
-  const user = await getUserById(userId);
-  if (!user) {
-    throw new Error('Không tìm thấy tài khoản');
-  }
-
-  const displayName = payload.displayName || payload.fullName || payload.display_name;
-  const email = payload.email;
-  const phone = payload.phone || payload.phoneNumber || payload.phone_number;
-  const avatarUrl = payload.avatarUrl || payload.avatar_url;
-  const coverImage = payload.coverImage || payload.cover_url;
-
-  const updateParts = [];
-  const names = {};
-  const values = {};
-
-  if (displayName !== undefined) {
-    if (String(displayName).trim().length < 2 || String(displayName).trim().length > 50) {
-      throw new Error('Họ tên phải từ 2-50 ký tự');
-    }
-    updateParts.push('#display_name = :display_name');
-    names['#display_name'] = 'display_name';
-    values[':display_name'] = String(displayName).trim();
-  }
-
-  if (email !== undefined) {
-    if (String(email).trim() !== '' && !isValidEmail(email)) {
-      throw new Error('Email không hợp lệ');
-    }
-    updateParts.push('#email = :email');
-    names['#email'] = 'email';
-    values[':email'] = String(email || '').trim() || null;
-    updateParts.push('#email_verified = :email_verified');
-    names['#email_verified'] = 'email_verified';
-    values[':email_verified'] = false;
-  }
-
-  if (phone !== undefined) {
-    if (!isValidPhone(phone)) {
-      throw new Error('Số điện thoại không hợp lệ');
-    }
-    updateParts.push('#phone_number = :phone_number');
-    names['#phone_number'] = 'phone_number';
-    values[':phone_number'] = String(phone).trim();
-    updateParts.push('#phone_verified = :phone_verified');
-    names['#phone_verified'] = 'phone_verified';
-    values[':phone_verified'] = false;
-  }
-
-  if (avatarUrl !== undefined) {
-    updateParts.push('#avatar_url = :avatar_url');
-    names['#avatar_url'] = 'avatar_url';
-    values[':avatar_url'] = String(avatarUrl || '').trim() || null;
-  }
-
-  if (coverImage !== undefined) {
-    updateParts.push('#coverImage = :coverImage');
-    names['#coverImage'] = 'coverImage';
-    values[':coverImage'] = String(coverImage || '').trim() || null;
-  }
-
-  if (updateParts.length === 0) {
-    throw new Error('Không có dữ liệu cần cập nhật');
-  }
-
-  updateParts.push('#updated_at = :updated_at');
-  names['#updated_at'] = 'updated_at';
-  values[':updated_at'] = new Date().toISOString();
-
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: USERS_TABLE,
-    Key: { userId: String(user.userId || userId) },
-    UpdateExpression: `SET ${updateParts.join(', ')}`,
-    ExpressionAttributeNames: names,
-    ExpressionAttributeValues: values,
-  }));
-
-  return getUserById(user.userId || userId);
-}
-
-async function saveFcmToken(userId, token, platform) {
-  if (!userId || !token) return;
-  const user = await getUserById(userId);
-  if (!user) return;
-
-  const currentTokens = Array.isArray(user.fcm_tokens) ? user.fcm_tokens : [];
-  if (!currentTokens.includes(token)) {
-    const updatedTokens = [...currentTokens, token];
-    await ddbDocClient.send(new UpdateCommand({
-      TableName: USERS_TABLE,
-      Key: { userId: String(user.userId || userId) },
-      UpdateExpression: 'SET fcm_tokens = :fcm_tokens',
-      ExpressionAttributeValues: {
-        ':fcm_tokens': updatedTokens,
-      },
-    }));
-  }
-}
-
-async function removeFcmToken(userId, token) {
-  if (!userId || !token) return;
-  const user = await getUserById(userId);
-  if (!user) return;
-
-  const currentTokens = Array.isArray(user.fcm_tokens) ? user.fcm_tokens : [];
-  const updatedTokens = currentTokens.filter(t => t !== token);
-  
-  if (currentTokens.length !== updatedTokens.length) {
-    await ddbDocClient.send(new UpdateCommand({
-      TableName: USERS_TABLE,
-      Key: { userId: String(user.userId || userId) },
-      UpdateExpression: 'SET fcm_tokens = :fcm_tokens',
-      ExpressionAttributeValues: {
-        ':fcm_tokens': updatedTokens,
-      },
-    }));
-  }
-}
-
-async function changePassword(userId, currentPassword, newPassword, username) {
-  if (!currentPassword || !newPassword) {
-    throw new Error('Thiếu mật khẩu hiện tại hoặc mật khẩu mới');
-  }
-  if (!isStrongPassword(newPassword)) {
-    throw new Error('Mật khẩu mới phải có ít nhất 8 ký tự, gồm chữ hoa, chữ thường và số');
-  }
-
-  const user = await resolveAuthUser(userId, username);
-  if (!user) {
-    throw new Error('Không tìm thấy tài khoản');
-  }
-
-  let rawUser = null;
-  const resolvedUserId = user.userId || userId || user.id;
-  if (resolvedUserId) {
-    const rawById = await ddbDocClient.send(new GetCommand({
-      TableName: USERS_TABLE,
-      Key: { userId: String(resolvedUserId) },
-    }));
-    rawUser = rawById.Item || null;
-  }
-
-  if (!rawUser && user.username) {
-    rawUser = await findUserByIdentifier({ username: user.username });
-  }
-
-  if (!rawUser) {
-    throw new Error('Không tìm thấy tài khoản');
-  }
-
-  const matched = await bcrypt.compare(String(currentPassword), String(rawUser.password_hash || ''));
-  if (!matched) {
-    throw new Error('Mật khẩu hiện tại không chính xác');
-  }
-
-  const newHash = await bcrypt.hash(String(newPassword), 10);
-
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: USERS_TABLE,
-    Key: { userId: String(rawUser.userId) },
-    UpdateExpression: 'SET #password_hash = :password_hash, #updated_at = :updated_at',
-    ExpressionAttributeNames: {
-      '#password_hash': 'password_hash',
-      '#updated_at': 'updated_at',
-    },
-    ExpressionAttributeValues: {
-      ':password_hash': newHash,
-      ':updated_at': new Date().toISOString(),
-    },
-  }));
-}
-
 async function sendEmailOTP(email) {
   if (!isValidEmail(email)) {
     throw new Error('Email không hợp lệ');
@@ -779,21 +732,10 @@ async function verifyEmailOTP(email, otp) {
 
   const found = await findUserByIdentifier({ email: targetEmail });
   if (found?.userId) {
-    await ddbDocClient.send(new UpdateCommand({
-      TableName: USERS_TABLE,
-      Key: { userId: String(found.userId) },
-      UpdateExpression: 'SET #email = :email, #email_verified = :email_verified, #updated_at = :updated_at',
-      ExpressionAttributeNames: {
-        '#email': 'email',
-        '#email_verified': 'email_verified',
-        '#updated_at': 'updated_at',
-      },
-      ExpressionAttributeValues: {
-        ':email': targetEmail,
-        ':email_verified': true,
-        ':updated_at': new Date().toISOString(),
-      },
-    }));
+    await pool.query(
+      'UPDATE users SET email = ?, email_verified = 1, updated_at = ? WHERE user_id = ?',
+      [targetEmail, new Date().toISOString(), String(found.userId)]
+    );
   }
 }
 
@@ -831,21 +773,10 @@ async function verifyPhoneOTP(phone, otp) {
 
   const found = await findUserByIdentifier({ phone: targetPhone });
   if (found?.userId) {
-    await ddbDocClient.send(new UpdateCommand({
-      TableName: USERS_TABLE,
-      Key: { userId: String(found.userId) },
-      UpdateExpression: 'SET #phone_number = :phone_number, #phone_verified = :phone_verified, #updated_at = :updated_at',
-      ExpressionAttributeNames: {
-        '#phone_number': 'phone_number',
-        '#phone_verified': 'phone_verified',
-        '#updated_at': 'updated_at',
-      },
-      ExpressionAttributeValues: {
-        ':phone_number': targetPhone,
-        ':phone_verified': true,
-        ':updated_at': new Date().toISOString(),
-      },
-    }));
+    await pool.query(
+      'UPDATE users SET phone_number = ?, phone_verified = 1, updated_at = ? WHERE user_id = ?',
+      [targetPhone, new Date().toISOString(), String(found.userId)]
+    );
   }
 }
 
@@ -883,19 +814,11 @@ async function resetPassword({ identifier, otp, type, newPassword }) {
   }
 
   const newHash = await bcrypt.hash(String(newPassword), 10);
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: USERS_TABLE,
-    Key: { userId: String(rawUser.userId) },
-    UpdateExpression: 'SET #password_hash = :password_hash, #updated_at = :updated_at',
-    ExpressionAttributeNames: {
-      '#password_hash': 'password_hash',
-      '#updated_at': 'updated_at',
-    },
-    ExpressionAttributeValues: {
-      ':password_hash': newHash,
-      ':updated_at': new Date().toISOString(),
-    },
-  }));
+  await pool.query('UPDATE users SET password_hash = ?, updated_at = ? WHERE user_id = ?', [
+    newHash,
+    new Date().toISOString(),
+    String(rawUser.userId),
+  ]);
 }
 
 module.exports = {

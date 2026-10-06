@@ -31,6 +31,7 @@ const postRoutes = require("./modules/posts/postRoutes");
 const storyRoutes = require("./modules/stories/storyRoutes");
 const { recoverCallsOnBoot } = require("./modules/calls/callRecovery");
 const { startReminderScheduler } = require("./modules/reminders/reminderScheduler");
+const { initSchema } = require("./db/initSchema");
 
 // Socket Handler
 const {
@@ -112,18 +113,25 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 4000;
 
-server.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(
-    `OTT Community backend (Restructured) is running on port ${PORT}`,
-  );
+initSchema()
+  .catch((err) => {
+    console.error("[BOOT] MySQL schema init failed:", err.message);
+    process.exit(1);
+  })
+  .then(() => {
+    server.listen(PORT, () => {
+      // eslint-disable-next-line no-console
+      console.log(
+        `OTT Community backend (Restructured) is running on port ${PORT}`,
+      );
 
-  // Phase 2d: Recover orphaned call state from previous server instance
-  recoverCallsOnBoot(io).catch((err) => {
-    console.error("[BOOT] Call recovery failed:", err.message);
+      // Phase 2d: Recover orphaned call state from previous server instance
+      recoverCallsOnBoot(io).catch((err) => {
+        console.error("[BOOT] Call recovery failed:", err.message);
+      });
+
+      startReminderScheduler(io);
+    });
   });
-
-  startReminderScheduler(io);
-});
 
 module.exports = { app, server, io };

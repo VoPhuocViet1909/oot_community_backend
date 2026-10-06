@@ -1,7 +1,4 @@
-const { ddbDocClient } = require("../../config/awsConfig");
-const { GetCommand, PutCommand } = require("@aws-sdk/lib-dynamodb");
-
-const MESSAGES_TABLE = process.env.DDB_MESSAGES_TABLE || "ott_messages";
+const { pool } = require("../../config/mysqlConfig");
 
 /**
  * Marks a message as "deleted for me" for the given user.
@@ -34,30 +31,28 @@ async function deleteMessageForMe(conversationId, messageId, userId) {
   const normalizedMessageId = String(messageId);
   const normalizedUserId = String(userId);
 
-  // 1. Fetch the conversation document
-  let getRes;
+  // 1. Fetch the conversation row
+  let rows;
   try {
-    getRes = await ddbDocClient.send(
-      new GetCommand({
-        TableName: MESSAGES_TABLE,
-        Key: { conversationId },
-      }),
+    [rows] = await pool.query(
+      "SELECT messages FROM messages WHERE conversation_id = ? LIMIT 1",
+      [conversationId],
     );
   } catch (dbError) {
-    console.error("[messageDeleteService] DynamoDB GetCommand failed:", dbError);
+    console.error("[messageDeleteService] MySQL SELECT failed:", dbError);
     const err = new Error("Failed to fetch conversation from database");
     err.code = "INTERNAL_ERROR";
     throw err;
   }
 
-  if (!getRes.Item) {
+  if (!rows[0]) {
     const err = new Error(`Conversation "${conversationId}" not found`);
     err.code = "NOT_FOUND";
     throw err;
   }
 
-  const messages = Array.isArray(getRes.Item.messages)
-    ? getRes.Item.messages.slice()
+  const messages = Array.isArray(rows[0].messages)
+    ? rows[0].messages.slice()
     : [];
 
   // 2. Locate the target message
@@ -97,19 +92,16 @@ async function deleteMessageForMe(conversationId, messageId, userId) {
     deletedFor: updatedDeletedFor,
   };
 
-  // 7. Persist the updated messages array back to DynamoDB
+  // 7. Persist the updated messages array back to MySQL
   try {
-    await ddbDocClient.send(
-      new PutCommand({
-        TableName: MESSAGES_TABLE,
-        Item: {
-          conversationId,
-          messages,
-        },
-      }),
+    await pool.query(
+      `INSERT INTO messages (conversation_id, messages, updated_at)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE messages = VALUES(messages), updated_at = VALUES(updated_at)`,
+      [conversationId, JSON.stringify(messages), new Date().toISOString()],
     );
   } catch (dbError) {
-    console.error("[messageDeleteService] DynamoDB PutCommand failed:", dbError);
+    console.error("[messageDeleteService] MySQL UPSERT failed:", dbError);
     const err = new Error("Failed to persist message deletion to database");
     err.code = "INTERNAL_ERROR";
     throw err;

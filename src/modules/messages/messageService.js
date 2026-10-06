@@ -1,16 +1,10 @@
-const { ddbDocClient } = require("../../config/awsConfig");
-const { PutCommand, GetCommand, ScanCommand, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
-const { PutObjectCommand } = require("@aws-sdk/client-s3");
+const { pool } = require("../../config/mysqlConfig");
 const { randomUUID } = require("crypto");
-const { s3Client } = require("../../config/awsConfig");
+const { uploadBuffer } = require("../media/uploadService");
 const { getGroupsForUser } = require("../groups/groupService");
 
-// Bảng messages trong DynamoDB (primary key: conversationId (S))
-// Mỗi conversationId sẽ là 1 document chứa mảng messages
-const MESSAGES_TABLE = process.env.DDB_MESSAGES_TABLE || "ott_messages";
-const FILE_MESSAGES_TABLE = process.env.DYNAMODB_TABLE_NAME || MESSAGES_TABLE;
-const S3_BUCKET_NAME = process.env.S3_BUCKET_NAME;
-const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
+// Bảng messages trong MySQL (primary key: conversation_id)
+// Mỗi conversationId sẽ là 1 row chứa mảng messages (JSON column)
 const BOT_AI_AVATAR_URL =
   process.env.BOT_AI_AVATAR_URL || "/botai-avatar.svg";
 
@@ -52,6 +46,34 @@ function normalizeContentType(raw) {
 }
 
 /**
+ * Lấy mảng messages của một conversation từ MySQL.
+ * @param {string} conversationId
+ * @returns {Promise<Array|null>} mảng messages, hoặc null nếu conversation chưa tồn tại
+ */
+async function getConversationMessages(conversationId) {
+  const [rows] = await pool.query(
+    "SELECT messages FROM messages WHERE conversation_id = ? LIMIT 1",
+    [conversationId],
+  );
+  if (!rows[0]) return null;
+  return Array.isArray(rows[0].messages) ? rows[0].messages : [];
+}
+
+/**
+ * Ghi lại toàn bộ mảng messages của một conversation (read-modify-write pattern).
+ * @param {string} conversationId
+ * @param {Array} messages
+ */
+async function putConversationMessages(conversationId, messages) {
+  await pool.query(
+    `INSERT INTO messages (conversation_id, messages, updated_at)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE messages = VALUES(messages), updated_at = VALUES(updated_at)`,
+    [conversationId, JSON.stringify(messages), new Date().toISOString()],
+  );
+}
+
+/**
  * Lấy thông tin cơ bản của tin nhắn gốc để hiển thị trong reply preview.
  * @param {string} conversationId - ID của cuộc trò chuyện
  * @param {string|number} replyToId - ID của tin nhắn cần trả lời
@@ -61,18 +83,13 @@ async function getRepliedMessageInfo(conversationId, replyToId) {
   if (!replyToId) return null;
 
   try {
-    const res = await ddbDocClient.send(
-      new GetCommand({
-        TableName: MESSAGES_TABLE,
-        Key: { conversationId },
-      }),
-    );
+    const existingMessages = await getConversationMessages(conversationId);
 
-    if (!res.Item || !Array.isArray(res.Item.messages)) {
+    if (!existingMessages) {
       return null;
     }
 
-    const originalMessage = res.Item.messages.find(
+    const originalMessage = existingMessages.find(
       (msg) => String(msg.id) === String(replyToId),
     );
 
@@ -140,13 +157,11 @@ async function enrichSenderInfo(senderId) {
   }
 
   try {
-    const result = await ddbDocClient.send(
-      new GetCommand({
-        TableName: USERS_TABLE,
-        Key: { userId: String(senderId) },
-      }),
+    const [rows] = await pool.query(
+      "SELECT display_name, username, avatar_url FROM users WHERE user_id = ? LIMIT 1",
+      [String(senderId)],
     );
-    const u = result.Item;
+    const u = rows[0];
     return {
       senderDisplayName: u?.display_name || u?.username || String(senderId),
       senderAvatarUrl: u?.avatar_url || null,
@@ -295,31 +310,11 @@ async function saveMessage(payload) {
   };
 
   // Lấy conversation hiện tại (nếu có)
-  const getRes = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MESSAGES_TABLE,
-      Key: { conversationId: payload.conversationId },
-    }),
-  );
-
-  const existing = getRes.Item || {
-    conversationId: payload.conversationId,
-    messages: [],
-  };
-  const messages = Array.isArray(existing.messages)
-    ? existing.messages.slice()
-    : [];
+  const existingMessages = await getConversationMessages(payload.conversationId);
+  const messages = existingMessages ? existingMessages.slice() : [];
   messages.push(newMessage);
 
-  await ddbDocClient.send(
-    new PutCommand({
-      TableName: MESSAGES_TABLE,
-      Item: {
-        conversationId: payload.conversationId,
-        messages,
-      },
-    }),
-  );
+  await putConversationMessages(payload.conversationId, messages);
 
   return {
     id: newMessage.id,
@@ -348,19 +343,14 @@ async function saveMessage(payload) {
 async function getMessagesForConversation(conversationId, currentUserId) {
   if (!conversationId) return [];
 
-  const res = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MESSAGES_TABLE,
-      Key: { conversationId },
-    }),
-  );
+  const existingMessages = await getConversationMessages(conversationId);
 
-  if (!res.Item || !Array.isArray(res.Item.messages)) {
+  if (!existingMessages) {
     return [];
   }
 
   // Filter out messages this user has hidden via "delete for me"
-  let messages = res.Item.messages;
+  let messages = existingMessages;
   if (currentUserId) {
     messages = messages.filter(
       (msg) => !msg.deletedFor?.map(String).includes(String(currentUserId)),
@@ -450,31 +440,19 @@ function resolveAttachmentType(mimetype, originalname) {
   return "file";
 }
 
-function sanitizeFilename(filename) {
-  return String(filename || "file").replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-
 async function uploadFileToS3(file) {
   if (!file) {
     throw new Error("file is required");
   }
-  if (!S3_BUCKET_NAME) {
-    throw new Error("S3_BUCKET_NAME is not configured");
-  }
 
-  const fileKey = `messages/${Date.now()}-${randomUUID()}-${sanitizeFilename(file.originalname)}`;
-
-  const command = new PutObjectCommand({
-    Bucket: S3_BUCKET_NAME,
-    Key: fileKey,
-    Body: file.buffer,
-    ContentType: file.mimetype,
+  const { url } = await uploadBuffer({
+    buffer: file.buffer,
+    keyPrefix: "messages",
+    contentType: file.mimetype,
   });
 
-  await s3Client.send(command);
-
   return {
-    url: `https://${S3_BUCKET_NAME}.s3.amazonaws.com/${fileKey}`,
+    url,
     mimetype: file.mimetype,
     size: file.size,
     originalname: file.originalname,
@@ -525,28 +503,11 @@ async function saveFileMessage(data) {
   };
 
   // Ưu tiên lưu đồng nhất với saveMessage để không lệch schema dữ liệu.
-  const getRes = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MESSAGES_TABLE,
-      Key: { conversationId },
-    }),
-  );
-
-  const existing = getRes.Item || { conversationId, messages: [] };
-  const messages = Array.isArray(existing.messages)
-    ? existing.messages.slice()
-    : [];
+  const existingMessages = await getConversationMessages(conversationId);
+  const messages = existingMessages ? existingMessages.slice() : [];
   messages.push(fileMessage);
 
-  await ddbDocClient.send(
-    new PutCommand({
-      TableName: MESSAGES_TABLE,
-      Item: {
-        conversationId,
-        messages,
-      },
-    }),
-  );
+  await putConversationMessages(conversationId, messages);
 
   const item = {
     id: persistedMessageId,
@@ -689,14 +650,9 @@ async function searchMessagesInConversation({
     throw new Error("conversationId is required");
   }
 
-  const res = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MESSAGES_TABLE,
-      Key: { conversationId },
-    }),
-  );
+  const existingMessages = await getConversationMessages(conversationId);
 
-  let messages = Array.isArray(res.Item?.messages) ? res.Item.messages.slice() : [];
+  let messages = existingMessages ? existingMessages.slice() : [];
 
   if (currentUserId) {
     messages = messages.filter(
@@ -790,45 +746,37 @@ async function searchMessagesForUserGlobal({
   );
 
   const rows = [];
-  let lastEvaluatedKey;
-  do {
-    const scanRes = await ddbDocClient.send(
-      new ScanCommand({
-        TableName: MESSAGES_TABLE,
-        ExclusiveStartKey: lastEvaluatedKey,
-      }),
-    );
+  const [conversationRows] = await pool.query(
+    "SELECT conversation_id, messages FROM messages",
+  );
 
-    for (const item of scanRes.Items || []) {
-      const conversationId = String(item?.conversationId || "").trim();
-      if (!conversationId) continue;
+  for (const item of conversationRows || []) {
+    const conversationId = String(item?.conversation_id || "").trim();
+    if (!conversationId) continue;
 
-      const accessible = conversationId.startsWith("dm:")
-        ? isDmConversationAccessible(conversationId, userId)
-        : allowedGroupIds.has(conversationId);
+    const accessible = conversationId.startsWith("dm:")
+      ? isDmConversationAccessible(conversationId, userId)
+      : allowedGroupIds.has(conversationId);
 
-      if (!accessible) continue;
+    if (!accessible) continue;
 
-      const messages = Array.isArray(item.messages) ? item.messages : [];
-      for (const msg of messages) {
-        if (msg?.deletedFor?.map(String).includes(userId)) {
-          continue;
-        }
-
-        const match = messageMatchesSearchFilters(msg, {
-          keyword: normalizedKeyword,
-          senderId: "",
-          fromMs,
-          toMs,
-        });
-        if (!match) continue;
-
-        rows.push({ ...msg, conversationId });
+    const messages = Array.isArray(item.messages) ? item.messages : [];
+    for (const msg of messages) {
+      if (msg?.deletedFor?.map(String).includes(userId)) {
+        continue;
       }
-    }
 
-    lastEvaluatedKey = scanRes.LastEvaluatedKey;
-  } while (lastEvaluatedKey);
+      const match = messageMatchesSearchFilters(msg, {
+        keyword: normalizedKeyword,
+        senderId: "",
+        fromMs,
+        toMs,
+      });
+      if (!match) continue;
+
+      rows.push({ ...msg, conversationId });
+    }
+  }
 
   rows.sort((a, b) => {
     const aMs = getMessageTimeMs(a) || 0;
@@ -946,18 +894,13 @@ async function stopLiveLocationMessage(conversationId, messageId, stoppedAt) {
     throw new Error("conversationId và messageId là bắt buộc");
   }
 
-  const res = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MESSAGES_TABLE,
-      Key: { conversationId },
-    })
-  );
+  const existingMessages = await getConversationMessages(conversationId);
 
-  if (!res.Item || !Array.isArray(res.Item.messages)) {
+  if (!existingMessages) {
     return null;
   }
 
-  const messages = res.Item.messages.slice();
+  const messages = existingMessages.slice();
   const idx = messages.findIndex((m) => String(m.id) === String(messageId));
   if (idx === -1) return null;
 
@@ -974,16 +917,8 @@ async function stopLiveLocationMessage(conversationId, messageId, stoppedAt) {
     },
   };
 
-  // Ghi lại toàn bộ mảng messages (DynamoDB document store)
-  await ddbDocClient.send(
-    new PutCommand({
-      TableName: MESSAGES_TABLE,
-      Item: {
-        conversationId,
-        messages,
-      },
-    })
-  );
+  // Ghi lại toàn bộ mảng messages
+  await putConversationMessages(conversationId, messages);
 
   return messages[idx];
 }
@@ -1002,18 +937,13 @@ async function stopLiveLocationMessage(conversationId, messageId, stoppedAt) {
 async function markGroupCallActiveMessageEnded(conversationId, callId, endedAt) {
   if (!conversationId || !callId) return null;
 
-  const res = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MESSAGES_TABLE,
-      Key: { conversationId },
-    })
-  );
+  const existingMessages = await getConversationMessages(conversationId);
 
-  if (!res.Item || !Array.isArray(res.Item.messages)) {
+  if (!existingMessages) {
     return null;
   }
 
-  const messages = res.Item.messages.slice();
+  const messages = existingMessages.slice();
   const idx = messages.findIndex(
     (m) => m.contentType === "group_call_active" && m.callData?.callId === callId,
   );
@@ -1038,16 +968,8 @@ async function markGroupCallActiveMessageEnded(conversationId, callId, endedAt) 
     },
   };
 
-  // Write back full messages array (DynamoDB document store)
-  await ddbDocClient.send(
-    new PutCommand({
-      TableName: MESSAGES_TABLE,
-      Item: {
-        conversationId,
-        messages,
-      },
-    })
-  );
+  // Write back full messages array
+  await putConversationMessages(conversationId, messages);
 
   // Broadcast message update realtime
   try {

@@ -1,18 +1,37 @@
 const { randomUUID } = require("crypto");
-const {
-  GetCommand,
-  PutCommand,
-  ScanCommand,
-  UpdateCommand,
-} = require("@aws-sdk/lib-dynamodb");
-const { ddbDocClient } = require("../../config/awsConfig");
+const { pool } = require("../../config/mysqlConfig");
 const friendService = require("../users/friendService");
 const userService = require("../users/userService");
 const { saveMessage } = require("../messages/messageService");
 
-const STORIES_TABLE = process.env.DDB_STORIES_TABLE || "ott_stories";
 const STORY_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const VALID_TYPES = new Set(["image", "text"]);
+
+/* ─── row <-> app object mapping ─────────────────────────────────────────── */
+
+function mapStoryRow(row) {
+  if (!row) return null;
+  return {
+    storyId: row.story_id,
+    userId: row.user_id,
+    authorName: row.author_name,
+    authorAvatar: row.author_avatar,
+    type: row.type,
+    text: row.text,
+    mediaUrl: row.media_url,
+    backgroundColor: row.background_color,
+    textX: row.text_x,
+    textY: row.text_y,
+    textScale: row.text_scale,
+    textRotation: row.text_rotation,
+    isHighlighted: !!row.is_highlighted,
+    highlightedAt: row.highlighted_at,
+    likes: Array.isArray(row.likes) ? row.likes : [],
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+  };
+}
+
 function normalizeStory(item) {
   return {
     ...item,
@@ -60,21 +79,58 @@ async function createStory(userId, payload = {}) {
     expiresAt: new Date(now.getTime() + STORY_LIFETIME_MS).toISOString(),
   };
 
-  await ddbDocClient.send(new PutCommand({ TableName: STORIES_TABLE, Item: item }));
+  await pool.query(
+    `INSERT INTO stories
+      (story_id, user_id, author_name, author_avatar, type, text, media_url, background_color,
+       text_x, text_y, text_scale, text_rotation, is_highlighted, highlighted_at, likes, created_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      item.storyId,
+      item.userId,
+      item.authorName,
+      item.authorAvatar,
+      item.type,
+      item.text,
+      item.mediaUrl,
+      item.backgroundColor,
+      item.textX,
+      item.textY,
+      item.textScale,
+      item.textRotation,
+      item.isHighlighted ? 1 : 0,
+      item.highlightedAt,
+      JSON.stringify(item.likes),
+      item.createdAt,
+      item.expiresAt,
+    ],
+  );
+
   return normalizeStory(item);
 }
 
 async function getStory(storyId) {
-  const result = await ddbDocClient.send(new GetCommand({
-    TableName: STORIES_TABLE,
-    Key: { storyId: String(storyId) },
-  }));
-  return result.Item ? normalizeStory(result.Item) : null;
+  const [rows] = await pool.query(
+    "SELECT * FROM stories WHERE story_id = ? LIMIT 1",
+    [String(storyId)],
+  );
+  const story = mapStoryRow(rows[0]);
+  return story ? normalizeStory(story) : null;
 }
 
-async function scanStories() {
-  const result = await ddbDocClient.send(new ScanCommand({ TableName: STORIES_TABLE }));
-  return (result.Items || []).map(normalizeStory);
+async function scanActiveStories() {
+  const [rows] = await pool.query(
+    "SELECT * FROM stories WHERE expires_at > ?",
+    [new Date().toISOString()],
+  );
+  return rows.map(mapStoryRow).map(normalizeStory);
+}
+
+async function scanUserStories(userId) {
+  const [rows] = await pool.query(
+    "SELECT * FROM stories WHERE user_id = ?",
+    [String(userId)],
+  );
+  return rows.map(mapStoryRow).map(normalizeStory);
 }
 
 async function getFeed(userId) {
@@ -83,10 +139,8 @@ async function getFeed(userId) {
     String(userId),
     ...friends.map((friend) => String(friend.friend_id || friend.userId)),
   ]);
-  const now = Date.now();
-  const stories = (await scanStories())
+  const stories = (await scanActiveStories())
     .filter((story) => allowedUserIds.has(String(story.userId)))
-    .filter((story) => new Date(story.expiresAt).getTime() > now)
     .sort((left, right) => {
       const leftIsMine = String(left.userId) === String(userId);
       const rightIsMine = String(right.userId) === String(userId);
@@ -97,8 +151,8 @@ async function getFeed(userId) {
 }
 
 async function getHighlights(userId) {
-  const stories = (await scanStories())
-    .filter((story) => String(story.userId) === String(userId) && story.isHighlighted)
+  const stories = (await scanUserStories(userId))
+    .filter((story) => story.isHighlighted)
     .sort((left, right) =>
       new Date(right.highlightedAt || right.createdAt).getTime()
       - new Date(left.highlightedAt || left.createdAt).getTime());
@@ -106,8 +160,7 @@ async function getHighlights(userId) {
 }
 
 async function getArchive(userId) {
-  const stories = (await scanStories())
-    .filter((story) => String(story.userId) === String(userId))
+  const stories = (await scanUserStories(userId))
     .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
   return { stories, count: stories.length };
 }
@@ -121,19 +174,10 @@ async function toggleHighlight(storyId, userId) {
 
   const isHighlighted = !story.isHighlighted;
   const highlightedAt = isHighlighted ? new Date().toISOString() : null;
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: STORIES_TABLE,
-    Key: { storyId: String(storyId) },
-    UpdateExpression: "SET #highlighted = :highlighted, #highlightedAt = :highlightedAt",
-    ExpressionAttributeNames: {
-      "#highlighted": "isHighlighted",
-      "#highlightedAt": "highlightedAt",
-    },
-    ExpressionAttributeValues: {
-      ":highlighted": isHighlighted,
-      ":highlightedAt": highlightedAt,
-    },
-  }));
+  await pool.query(
+    "UPDATE stories SET is_highlighted = ?, highlighted_at = ? WHERE story_id = ?",
+    [isHighlighted ? 1 : 0, highlightedAt, String(storyId)],
+  );
 
   return { ...story, isHighlighted, highlightedAt };
 }
@@ -148,13 +192,10 @@ async function toggleLike(storyId, userId) {
     ? story.likes.filter((id) => id !== userIdString)
     : [...story.likes, userIdString];
 
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: STORIES_TABLE,
-    Key: { storyId: String(storyId) },
-    UpdateExpression: "SET #likes = :likes",
-    ExpressionAttributeNames: { "#likes": "likes" },
-    ExpressionAttributeValues: { ":likes": likes },
-  }));
+  await pool.query(
+    "UPDATE stories SET likes = ? WHERE story_id = ?",
+    [JSON.stringify(likes), String(storyId)],
+  );
 
   return { ...story, likes, likeCount: likes.length, liked: !alreadyLiked };
 }

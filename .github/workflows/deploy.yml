@@ -1,4 +1,4 @@
-name: Deploy Node.js Backend to AWS EC2
+name: Deploy Node.js Backend to VM 110
 
 on:
   push:
@@ -15,30 +15,33 @@ jobs:
     - name: Checkout source code
       uses: actions/checkout@v4
 
-    - name: SSH into EC2 and Deploy
+    - name: SSH into VM 110 and Deploy
       uses: appleboy/ssh-action@master
       with:
-        host: ${{ secrets.EC2_HOST }}
-        username: ${{ secrets.EC2_USERNAME }}
-        key: ${{ secrets.EC2_SSH_KEY }}
+        host: ${{ secrets.VM110_HOST }}
+        username: ${{ secrets.VM110_USERNAME }}
+        key: ${{ secrets.VM110_SSH_KEY }}
         port: 22
         script: |
-          # 1. Ép hệ thống nạp cấu hình NVM và các biến môi trường của user ubuntu
+          # 1. Ép hệ thống nạp cấu hình NVM và các biến môi trường của user
           export NVM_DIR="$HOME/.nvm"
           [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
           [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
-          
-          # 2. Di chuyển vào đúng thư mục dự án trên EC2
+
+          # 2. Di chuyển vào đúng thư mục dự án trên VM 110
           cd /home/ubuntu/CNM_ott_community_backend
-          
+
           # 3. Kéo code mới nhất từ GitHub về máy ảo
           git pull origin main
-          
+
           # 4. Cài đặt các package mới (bỏ qua download chromium của puppeteer để tránh lỗi)
           PUPPETEER_SKIP_DOWNLOAD=true npm install
-          
-          # 5. Khởi động lại tiến trình PM2 cũ để cập nhật code mới
-          pm2 restart ott-backend --update-env
-          
-          # 6. Lưu lại trạng thái PM2
+
+          # 5. Đảm bảo MySQL/Redis (docker-compose) đang chạy
+          docker compose up -d
+
+          # 6. Khởi động (lần đầu) hoặc restart tiến trình PM2 để cập nhật code mới
+          pm2 startOrRestart ecosystem.config.js --update-env
+
+          # 7. Lưu lại trạng thái PM2
           pm2 save

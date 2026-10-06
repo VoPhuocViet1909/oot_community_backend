@@ -1,23 +1,15 @@
-const { ddbDocClient } = require('../../config/awsConfig');
-const { ScanCommand } = require('@aws-sdk/lib-dynamodb');
+const { pool } = require('../../config/mysqlConfig');
 
-const USERS_TABLE = process.env.DDB_USERS_TABLE || 'ott_users';
-const GROUPS_TABLE = process.env.DDB_GROUPS_TABLE || 'ott_groups';
-const MESSAGES_TABLE = process.env.DDB_MESSAGES_TABLE || 'ott_messages';
-
-async function countTable(tableName) {
-  const result = await ddbDocClient.send(new ScanCommand({
-    TableName: tableName,
-    Select: 'COUNT'
-  }));
-  return result.Count || 0;
+async function countRows(sql) {
+  const [rows] = await pool.query(sql);
+  return rows[0]?.cnt || 0;
 }
 
 async function getOverviewStats() {
   const [users, groups, messages] = await Promise.all([
-    countTable(USERS_TABLE),
-    countTable(GROUPS_TABLE),
-    countTable(MESSAGES_TABLE)
+    countRows('SELECT COUNT(*) AS cnt FROM users'),
+    countRows('SELECT COUNT(*) AS cnt FROM groups_'),
+    countRows('SELECT COUNT(*) AS cnt FROM messages'),
   ]);
 
   return {

@@ -2,9 +2,7 @@
 
 const groupCallService = require('./groupCallService');
 const { onlineUsers: defaultOnlineUsers } = require('../../socket/socketUserRegistry');
-const { ddbDocClient } = require('../../config/awsConfig');
-const { GetCommand } = require('@aws-sdk/lib-dynamodb');
-const USERS_TABLE = process.env.DDB_USERS_TABLE || 'ott_users';
+const { getUserById } = require('../users/userService');
 const { sendPushNotificationForCall } = require('../notifications/notificationService');
 
 // ── Reconnect grace timers for group calls ──────────────────────────────────
@@ -77,17 +75,11 @@ function getSocketUserId(socket) {
 }
 
 /**
- * Look up user display info from ott_users table.
+ * Look up user display info from the users table.
  */
 async function getUserDisplayInfo(userId) {
   try {
-    const result = await ddbDocClient.send(
-      new GetCommand({
-        TableName: USERS_TABLE,
-        Key: { userId: String(userId) },
-      }),
-    );
-    const u = result.Item;
+    const u = await getUserById(String(userId));
     return {
       displayName: u?.display_name || u?.username || String(userId),
       avatarUrl: u?.avatar_url || null,

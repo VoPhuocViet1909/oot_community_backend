@@ -1,7 +1,23 @@
-const { ddbDocClient } = require('../../config/awsConfig');
-const { PutCommand, GetCommand, UpdateCommand, DeleteCommand, ScanCommand } = require('@aws-sdk/lib-dynamodb');
+const { pool } = require('../../config/mysqlConfig');
 
-const FRIENDS_TABLE = process.env.DDB_FRIENDSHIPS_TABLE || 'ott_friendships';
+/* ─── row <-> app object mapping ─────────────────────────────────────────── */
+
+function mapFriendshipRow(row) {
+  if (!row) return null;
+  return {
+    friendshipId: row.friendship_id,
+    sender_id: row.sender_id,
+    receiver_id: row.receiver_id,
+    status: row.status,
+    nickname_sender: row.nickname_sender,
+    nickname_receiver: row.nickname_receiver,
+    chatBgUrl_sender: row.chat_bg_url_sender,
+    chatBgUrl_receiver: row.chat_bg_url_receiver,
+    pinnedMessages: row.pinned_messages || [],
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
 
 /* ─── helpers ─────────────────────────────────────────────────────────────── */
 
@@ -9,44 +25,37 @@ async function findExistingRecord(senderId, receiverId) {
   const uid = String(senderId);
   const rid = String(receiverId);
 
-  const res = await ddbDocClient.send(new ScanCommand({
-    TableName: FRIENDS_TABLE,
-    FilterExpression: '((sender_id = :s AND receiver_id = :r) OR (sender_id = :r AND receiver_id = :s))',
-    ExpressionAttributeValues: {
-      ':s': uid,
-      ':r': rid
-    }
-  }));
+  const [rows] = await pool.query(
+    `SELECT * FROM friendships
+     WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
+     LIMIT 1`,
+    [uid, rid, rid, uid]
+  );
 
-  return (res.Items && res.Items.length > 0) ? res.Items[0] : null;
+  return rows[0] ? mapFriendshipRow(rows[0]) : null;
 }
 
 async function putOrUpdateFriendship(item) {
-  await ddbDocClient.send(new PutCommand({
-    TableName: FRIENDS_TABLE,
-    Item: item
-  }));
+  await pool.query(
+    `INSERT INTO friendships (friendship_id, sender_id, receiver_id, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE sender_id = VALUES(sender_id), receiver_id = VALUES(receiver_id),
+       status = VALUES(status), updated_at = VALUES(updated_at)`,
+    [item.friendshipId, item.sender_id, item.receiver_id, item.status, item.created_at, item.updated_at]
+  );
 }
 
 async function updateFriendshipStatus(friendshipId, userId, status) {
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: FRIENDS_TABLE,
-    Key: { friendshipId: String(friendshipId) },
-    UpdateExpression: 'SET #st = :s, updated_at = :u',
-    ExpressionAttributeNames: { '#st': 'status' },
-    ExpressionAttributeValues: {
-      ':s': status,
-      ':u': new Date().toISOString()
-    }
-  }));
+  await pool.query('UPDATE friendships SET status = ?, updated_at = ? WHERE friendship_id = ?', [
+    status,
+    new Date().toISOString(),
+    String(friendshipId),
+  ]);
 }
 
 async function getFriendshipByFriendshipId(friendshipId) {
-  const res = await ddbDocClient.send(new GetCommand({
-    TableName: FRIENDS_TABLE,
-    Key: { friendshipId: String(friendshipId) }
-  }));
-  return res.Item || null;
+  const [rows] = await pool.query('SELECT * FROM friendships WHERE friendship_id = ?', [String(friendshipId)]);
+  return rows[0] ? mapFriendshipRow(rows[0]) : null;
 }
 
 /* ─── public functions ─────────────────────────────────────────────────────── */
@@ -82,7 +91,7 @@ async function sendFriendRequest(senderId, receiverId) {
         id: existing.friendshipId,
         sender_id: sender,
         receiver_id: receiver,
-        status: 'pending'
+        status: 'pending',
       };
     }
   }
@@ -95,7 +104,7 @@ async function sendFriendRequest(senderId, receiverId) {
     receiver_id: receiver,
     status: 'pending',
     created_at: now,
-    updated_at: now
+    updated_at: now,
   };
 
   await putOrUpdateFriendship(item);
@@ -104,7 +113,7 @@ async function sendFriendRequest(senderId, receiverId) {
     id: friendshipId,
     sender_id: sender,
     receiver_id: receiver,
-    status: 'pending'
+    status: 'pending',
   };
 }
 
@@ -140,8 +149,8 @@ async function acceptFriendRequest(friendshipId, userId) {
       id: rec.sender_id,
       display_name: '',
       username: '',
-      avatar_url: null
-    }
+      avatar_url: null,
+    },
   };
 }
 
@@ -166,10 +175,7 @@ async function rejectFriendRequest(friendshipId, userId) {
     throw err;
   }
 
-  await ddbDocClient.send(new DeleteCommand({
-    TableName: FRIENDS_TABLE,
-    Key: { friendshipId: String(friendshipId) }
-  }));
+  await pool.query('DELETE FROM friendships WHERE friendship_id = ?', [String(friendshipId)]);
 
   return { id: friendshipId, status: 'rejected' };
 }
@@ -177,17 +183,12 @@ async function rejectFriendRequest(friendshipId, userId) {
 async function getPendingRequests(userId) {
   const uid = String(userId);
 
-  const res = await ddbDocClient.send(new ScanCommand({
-    TableName: FRIENDS_TABLE,
-    FilterExpression: 'receiver_id = :uid AND #st = :pending',
-    ExpressionAttributeNames: { '#st': 'status' },
-    ExpressionAttributeValues: {
-      ':uid': uid,
-      ':pending': 'pending'
-    }
-  }));
+  const [rows] = await pool.query(
+    "SELECT * FROM friendships WHERE receiver_id = ? AND status = 'pending'",
+    [uid]
+  );
 
-  const items = (res.Items || []).sort((a, b) =>
+  const items = rows.map(mapFriendshipRow).sort((a, b) =>
     new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
   );
 
@@ -204,7 +205,7 @@ async function getPendingRequests(userId) {
         updated_at: item.updated_at,
         sender_display_name: senderInfo?.display_name || senderInfo?.displayName || '',
         sender_username: senderInfo?.username || '',
-        sender_avatar_url: senderInfo?.avatar_url || senderInfo?.avatarUrl || null
+        sender_avatar_url: senderInfo?.avatar_url || senderInfo?.avatarUrl || null,
       };
     })
   );
@@ -215,17 +216,12 @@ async function getPendingRequests(userId) {
 async function getFriends(userId) {
   const uid = String(userId);
 
-  const res = await ddbDocClient.send(new ScanCommand({
-    TableName: FRIENDS_TABLE,
-    FilterExpression: '(sender_id = :uid OR receiver_id = :uid) AND #st = :accepted',
-    ExpressionAttributeNames: { '#st': 'status' },
-    ExpressionAttributeValues: {
-      ':uid': uid,
-      ':accepted': 'accepted'
-    }
-  }));
+  const [rows] = await pool.query(
+    "SELECT * FROM friendships WHERE (sender_id = ? OR receiver_id = ?) AND status = 'accepted'",
+    [uid, uid]
+  );
 
-  const items = (res.Items || []).sort((a, b) =>
+  const items = rows.map(mapFriendshipRow).sort((a, b) =>
     new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
   );
 
@@ -250,7 +246,7 @@ async function getFriends(userId) {
         friend_avatar_url: friendInfo?.avatar_url || friendInfo?.avatarUrl || null,
         nickname: nickname,
         chatBgUrl: chatBgUrl,
-        pinnedMessages: item.pinnedMessages || []
+        pinnedMessages: item.pinnedMessages || [],
       };
     })
   );
@@ -271,17 +267,13 @@ async function updateNickname(friendshipId, userId, nickname) {
 
   const uid = String(userId);
   const isSender = String(rec.sender_id) === uid;
-  const field = isSender ? 'nickname_sender' : 'nickname_receiver';
+  const column = isSender ? 'nickname_sender' : 'nickname_receiver';
 
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: FRIENDS_TABLE,
-    Key: { friendshipId: String(friendshipId) },
-    UpdateExpression: `SET ${field} = :n, updated_at = :u`,
-    ExpressionAttributeValues: {
-      ':n': nickname || null,
-      ':u': new Date().toISOString()
-    }
-  }));
+  await pool.query(`UPDATE friendships SET ${column} = ?, updated_at = ? WHERE friendship_id = ?`, [
+    nickname || null,
+    new Date().toISOString(),
+    String(friendshipId),
+  ]);
 
   return { friendshipId, nickname: nickname || null };
 }
@@ -295,23 +287,21 @@ async function updateChatBackground(userId, friendshipId, bgUrl, bothSides = fal
 
   const uid = String(userId);
   const isSender = String(rec.sender_id) === uid;
-  
-  let updateExpr = '';
-  let attrValues = { ':bg': bgUrl || null, ':u': new Date().toISOString() };
+  const now = new Date().toISOString();
 
   if (bothSides) {
-    updateExpr = 'SET chatBgUrl_sender = :bg, chatBgUrl_receiver = :bg, updated_at = :u';
+    await pool.query(
+      'UPDATE friendships SET chat_bg_url_sender = ?, chat_bg_url_receiver = ?, updated_at = ? WHERE friendship_id = ?',
+      [bgUrl || null, bgUrl || null, now, String(friendshipId)]
+    );
   } else {
-    const field = isSender ? 'chatBgUrl_sender' : 'chatBgUrl_receiver';
-    updateExpr = `SET ${field} = :bg, updated_at = :u`;
+    const column = isSender ? 'chat_bg_url_sender' : 'chat_bg_url_receiver';
+    await pool.query(`UPDATE friendships SET ${column} = ?, updated_at = ? WHERE friendship_id = ?`, [
+      bgUrl || null,
+      now,
+      String(friendshipId),
+    ]);
   }
-
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: FRIENDS_TABLE,
-    Key: { friendshipId: String(friendshipId) },
-    UpdateExpression: updateExpr,
-    ExpressionAttributeValues: attrValues
-  }));
 
   return { friendshipId, chatBgUrl: bgUrl || null };
 }
@@ -330,23 +320,19 @@ async function pinMessage(friendshipId, message, pinnedBy) {
   let pinned = Array.isArray(rec.pinnedMessages) ? rec.pinnedMessages : [];
   // Tránh trùng lặp
   pinned = pinned.filter(m => String(m.id) !== String(message.id));
-  
+
   const pinObj = {
     ...message,
     pinnedBy: String(pinnedBy),
-    pinnedAt: new Date().toISOString()
+    pinnedAt: new Date().toISOString(),
   };
   pinned.unshift(pinObj); // Thêm vào đầu danh sách
 
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: FRIENDS_TABLE,
-    Key: { friendshipId: String(friendshipId) },
-    UpdateExpression: 'SET pinnedMessages = :p, updated_at = :u',
-    ExpressionAttributeValues: {
-      ':p': pinned,
-      ':u': new Date().toISOString()
-    }
-  }));
+  await pool.query('UPDATE friendships SET pinned_messages = ?, updated_at = ? WHERE friendship_id = ?', [
+    JSON.stringify(pinned),
+    new Date().toISOString(),
+    String(friendshipId),
+  ]);
   return pinned;
 }
 
@@ -355,7 +341,7 @@ async function unpinMessage(friendshipId, messageId, requestUserId) {
   if (!rec) throw new Error('Không tìm thấy quan hệ bạn bè');
 
   let pinned = Array.isArray(rec.pinnedMessages) ? rec.pinnedMessages : [];
-  
+
   // Kiểm tra quyền: Chỉ người ghim mới được gỡ (hoặc tin nhắn cũ chưa có pinnedBy)
   const pinToUnpin = pinned.find(m => String(m.id) === String(messageId));
   if (pinToUnpin && pinToUnpin.pinnedBy && String(pinToUnpin.pinnedBy) !== String(requestUserId)) {
@@ -364,15 +350,11 @@ async function unpinMessage(friendshipId, messageId, requestUserId) {
 
   pinned = pinned.filter(m => String(m.id) !== String(messageId));
 
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: FRIENDS_TABLE,
-    Key: { friendshipId: String(friendshipId) },
-    UpdateExpression: 'SET pinnedMessages = :p, updated_at = :u',
-    ExpressionAttributeValues: {
-      ':p': pinned,
-      ':u': new Date().toISOString()
-    }
-  }));
+  await pool.query('UPDATE friendships SET pinned_messages = ?, updated_at = ? WHERE friendship_id = ?', [
+    JSON.stringify(pinned),
+    new Date().toISOString(),
+    String(friendshipId),
+  ]);
   return pinned;
 }
 
@@ -403,15 +385,12 @@ async function unfriend(friendshipId, userId) {
     throw err;
   }
 
-  await ddbDocClient.send(new DeleteCommand({
-    TableName: FRIENDS_TABLE,
-    Key: { friendshipId: String(friendshipId) }
-  }));
+  await pool.query('DELETE FROM friendships WHERE friendship_id = ?', [String(friendshipId)]);
 
   return {
     friendshipId,
     status: 'unfriended',
-    unfriended_by: uid
+    unfriended_by: uid,
   };
 }
 

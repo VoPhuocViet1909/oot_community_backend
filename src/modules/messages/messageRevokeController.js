@@ -1,7 +1,6 @@
 const { revokeMessage } = require("./messageRevokeService");
 const { emitToUserSockets, onlineUsers } = require("../../socket/socketUserRegistry");
-
-const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
+const { pool } = require("../../config/mysqlConfig");
 
 /**
  * Extract participant user IDs from a conversationId.
@@ -22,19 +21,13 @@ async function getConversationParticipants(conversationId) {
     }
   }
 
-  // Group: query ott_group_members for all members
+  // Group: query group_members for all members
   try {
-    const { ddbDocClient } = require("../../config/awsConfig");
-    const { QueryCommand } = require("@aws-sdk/lib-dynamodb");
-    const result = await ddbDocClient.send(
-      new QueryCommand({
-        TableName: MEMBERS_TABLE,
-        KeyConditionExpression: "groupId = :gid",
-        ExpressionAttributeValues: { ":gid": normalized },
-        ProjectionExpression: "userId",
-      }),
+    const [rows] = await pool.query(
+      "SELECT user_id FROM group_members WHERE group_id = ?",
+      [normalized],
     );
-    const participants = (result.Items || []).map((i) => String(i.userId));
+    const participants = rows.map((row) => String(row.user_id));
     return { participants };
   } catch {
     return { participants: [] };

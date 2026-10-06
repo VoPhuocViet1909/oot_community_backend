@@ -1,9 +1,4 @@
-const { ddbDocClient } = require("../config/awsConfig");
-const {
-  PutCommand,
-  GetCommand,
-  QueryCommand,
-} = require("@aws-sdk/lib-dynamodb");
+const { pool } = require("../config/mysqlConfig");
 const { saveMessage } = require("../modules/messages/messageService");
 const { registerCallHandlers, handleDisconnect: handleCallDisconnect } = require("../modules/calls/callSocketHandler");
 const { registerGroupCallHandlers, handleGroupCallDisconnect } = require("../modules/calls/groupCallSocketHandler");
@@ -11,9 +6,6 @@ const { registerGroupCallHandlers, handleGroupCallDisconnect } = require("../mod
 const { saveReadReceipt, getUserLastReadMessage } = require("../modules/messages/readReceiptService");
 const { notifyMessageCreated } = require("../modules/notifications/notificationService");
 const { verifyToken } = require("../common/utils/jwt");
-const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
-const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
-const MESSAGES_TABLE = process.env.DDB_MESSAGES_TABLE || "ott_messages";
 
 // ============================================================
 // READ RECEIPT DEDUPLICATION CACHE
@@ -52,13 +44,11 @@ function isDuplicateReadReceipt(conversationId, messageId, userId) {
  */
 async function getUserDisplayInfo(userId) {
   try {
-    const result = await ddbDocClient.send(
-      new GetCommand({
-        TableName: USERS_TABLE,
-        Key: { userId: String(userId) },
-      }),
+    const [rows] = await pool.query(
+      "SELECT display_name, username, avatar_url FROM users WHERE user_id = ? LIMIT 1",
+      [String(userId)],
     );
-    const u = result.Item;
+    const u = rows[0];
     return {
       displayName: u?.display_name || u?.username || String(userId),
       avatarUrl: u?.avatar_url || null,
@@ -131,24 +121,17 @@ async function checkUserInGroup(groupId, userId) {
     targetGroupId = targetGroupId.replace("channel:", "");
   }
 
-  // --- Group: Query bảng ott_group_members với composite key (groupId, userId) ---
+  // --- Group: query bảng group_members với composite key (group_id, user_id) ---
   try {
-    const result = await ddbDocClient.send(
-      new QueryCommand({
-        TableName: MEMBERS_TABLE,
-        KeyConditionExpression: "groupId = :gid AND userId = :uid",
-        ExpressionAttributeValues: {
-          ":gid": targetGroupId,
-          ":uid": targetUserId,
-        },
-        Limit: 1,
-      }),
+    const [rows] = await pool.query(
+      "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1",
+      [targetGroupId, targetUserId],
     );
 
-    return !!(result.Items && result.Items.length > 0);
+    return rows.length > 0;
   } catch (error) {
     console.error(
-      `[checkUserInGroup] DynamoDB error for group=${targetGroupId} user=${targetUserId}:`,
+      `[checkUserInGroup] MySQL error for group=${targetGroupId} user=${targetUserId}:`,
       error.message,
     );
     return false;
@@ -463,17 +446,12 @@ function handleSocketConnection(io, socket) {
       if (Array.isArray(savedMessage.mentions) && savedMessage.mentions.length > 0) {
         if (savedMessage.mentions.includes("all")) {
           try {
-            const membersResult = await ddbDocClient.send(
-              new QueryCommand({
-                TableName: MEMBERS_TABLE,
-                KeyConditionExpression: "groupId = :gid",
-                ExpressionAttributeValues: {
-                  ":gid": String(payload.roomId),
-                },
-              })
+            const [memberRows] = await pool.query(
+              "SELECT user_id FROM group_members WHERE group_id = ?",
+              [String(payload.roomId)],
             );
-            const memberIds = (membersResult.Items || [])
-              .map((item) => String(item.userId))
+            const memberIds = memberRows
+              .map((row) => String(row.user_id))
               .filter((uid) => uid !== String(userId));
 
             memberIds.forEach((mentionedUserId) => {
@@ -574,17 +552,18 @@ function handleSocketConnection(io, socket) {
     if (!isMember) return _respond(callback, false, "Not a member of this group");
 
     try {
-      // Lấy tin nhắn poll từ DynamoDB
-      console.log(`[vote_poll] Fetching conversation ${roomId} from ${MESSAGES_TABLE}`);
-      const convRes = await ddbDocClient.send(
-        new GetCommand({ TableName: MESSAGES_TABLE, Key: { conversationId: roomId } })
+      // Lấy tin nhắn poll từ MySQL
+      console.log(`[vote_poll] Fetching conversation ${roomId} from messages table`);
+      const [convRows] = await pool.query(
+        "SELECT messages FROM messages WHERE conversation_id = ? LIMIT 1",
+        [roomId],
       );
 
-      if (!convRes.Item || !Array.isArray(convRes.Item.messages)) {
+      if (!convRows[0] || !Array.isArray(convRows[0].messages)) {
         return _respond(callback, false, "Không tìm thấy cuộc trò chuyện");
       }
 
-      const messages = convRes.Item.messages.slice();
+      const messages = convRows[0].messages.slice();
       const msgIndex = messages.findIndex((m) => String(m.id) === String(messageId));
 
       if (msgIndex === -1) {
@@ -628,13 +607,13 @@ function handleSocketConnection(io, socket) {
       // Cập nhật message trong mảng
       messages[msgIndex] = { ...msg, pollData };
 
-      // Lưu lại vào DynamoDB
-      console.log(`[vote_poll] Saving vote to ${MESSAGES_TABLE}, conversationId=${roomId}, messageId=${messageId}`);
-      await ddbDocClient.send(
-        new PutCommand({
-          TableName: MESSAGES_TABLE,
-          Item: { conversationId: roomId, messages },
-        })
+      // Lưu lại vào MySQL
+      console.log(`[vote_poll] Saving vote to messages table, conversationId=${roomId}, messageId=${messageId}`);
+      await pool.query(
+        `INSERT INTO messages (conversation_id, messages, updated_at)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE messages = VALUES(messages), updated_at = VALUES(updated_at)`,
+        [roomId, JSON.stringify(messages), new Date().toISOString()],
       );
       console.log(`[vote_poll] Vote saved successfully for message ${messageId}`);
 

@@ -1,9 +1,5 @@
-const { GetCommand } = require("@aws-sdk/lib-dynamodb");
-
-const { ddbDocClient } = require("../../config/awsConfig");
+const { pool } = require("../../config/mysqlConfig");
 const { saveMessage } = require("../messages/messageService");
-
-const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
 
 function toString(value) {
   return String(value ?? "").trim();
@@ -20,14 +16,12 @@ async function isConversationMember(conversationId, userId) {
   }
 
   const groupId = cid.startsWith("channel:") ? cid.slice("channel:".length) : cid;
-  const result = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MEMBERS_TABLE,
-      Key: { groupId, userId: uid },
-    }),
+  const [rows] = await pool.query(
+    "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1",
+    [groupId, uid],
   );
 
-  return Boolean(result.Item);
+  return rows.length > 0;
 }
 
 async function pinNoteMessage(conversationId, message, userId) {

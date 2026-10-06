@@ -1,32 +1,41 @@
 /**
  * Read Receipts Service
  * Handles storing and retrieving read receipts for messages
- * Uses DynamoDB for persistence
+ * Uses MySQL for persistence
  */
-const { ddbDocClient } = require("../../config/awsConfig");
-const { PutCommand, GetCommand, UpdateCommand, QueryCommand, ScanCommand } = require("@aws-sdk/lib-dynamodb");
-
-const READ_RECEIPTS_TABLE = process.env.DDB_READ_RECEIPTS_TABLE;
+const { pool } = require("../../config/mysqlConfig");
 
 /**
- * Generate read receipt key for a conversation
- * Format: conversationId#messageId
+ * Look up a user's display_name/avatar_url from the users table.
+ * read_receipts no longer stores a denormalized readerName/readerAvatar
+ * (unlike the old DynamoDB item), so any receipt we read back enriches
+ * from `users` to keep the same output shape callers expect.
  */
-function getReadReceiptKey(conversationId, messageId) {
-  return `${conversationId}#${messageId}`;
-}
-
-/**
- * Generate sort key for a reader
- * Format: userId#timestamp
- */
-function getReaderSortKey(userId) {
-  return `${userId}#${Date.now()}`;
+async function getUserBasicInfo(userId) {
+  try {
+    const [rows] = await pool.query(
+      "SELECT display_name, username, avatar_url FROM users WHERE user_id = ? LIMIT 1",
+      [String(userId)],
+    );
+    const u = rows[0];
+    return {
+      displayName: u?.display_name || u?.username || String(userId),
+      avatarUrl: u?.avatar_url || null,
+    };
+  } catch {
+    return { displayName: String(userId), avatarUrl: null };
+  }
 }
 
 /**
  * Save a read receipt
  * @param {Object} data - { conversationId, messageId, userId, readerName, readerAvatar }
+ *
+ * NOTE on the read-receipt key-shape fix: the old DynamoDB key was
+ * (conversationId, messageId) so a second reader's receipt overwrote the
+ * first reader's receipt for the same message. The new MySQL PK is
+ * (conversation_id, message_id, user_id), so every reader gets their own
+ * row and this upsert only ever touches that one reader's row.
  */
 async function saveReadReceipt(data) {
   const { conversationId, messageId, userId, readerName, readerAvatar } = data;
@@ -53,11 +62,11 @@ async function saveReadReceipt(data) {
   };
 
   try {
-    await ddbDocClient.send(
-      new PutCommand({
-        TableName: READ_RECEIPTS_TABLE,
-        Item: receipt,
-      })
+    await pool.query(
+      `INSERT INTO read_receipts (conversation_id, message_id, user_id, read_at)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE read_at = VALUES(read_at)`,
+      [conversationId, receipt.messageId, receipt.userId, readAt],
     );
 
     console.log(`[readReceipts] Saved read receipt for message ${messageId} by user ${userId}`);
@@ -69,7 +78,10 @@ async function saveReadReceipt(data) {
 }
 
 /**
- * Get read receipts for a specific message
+ * Get read receipts for a specific message.
+ * With the new (conversation_id, message_id, user_id) PK this naturally
+ * returns ALL readers of the message (previously only ever a single,
+ * possibly-wrong, receipt due to the old key-shape bug).
  * @param {string} conversationId
  * @param {string} messageId
  */
@@ -79,39 +91,29 @@ async function getReadReceiptsForMessage(conversationId, messageId) {
   }
 
   try {
-    // Query all items with this conversationId and messageId as GSI
-    // For simplicity, we use a Scan with filter
-    const result = await ddbDocClient.send(
-      new QueryCommand({
-        TableName: READ_RECEIPTS_TABLE,
-        IndexName: "conversationId-messageId-index",
-        KeyConditionExpression: "conversationId = :cid AND messageId = :mid",
-        ExpressionAttributeValues: {
-          ":cid": conversationId,
-          ":mid": String(messageId),
-        },
-      })
+    const [rows] = await pool.query(
+      "SELECT conversation_id, message_id, user_id, read_at FROM read_receipts WHERE conversation_id = ? AND message_id = ?",
+      [conversationId, String(messageId)],
     );
 
-    return result.Items || [];
+    const enriched = await Promise.all(
+      rows.map(async (row) => {
+        const info = await getUserBasicInfo(row.user_id);
+        return {
+          conversationId: row.conversation_id,
+          messageId: row.message_id,
+          userId: row.user_id,
+          readerName: info.displayName,
+          readerAvatar: info.avatarUrl,
+          readAt: row.read_at,
+        };
+      }),
+    );
+
+    return enriched;
   } catch (error) {
-    console.warn(`[readReceipts] GSI not found, using scan fallback:`, error.message);
-    try {
-      const scanResult = await ddbDocClient.send(
-        new ScanCommand({
-          TableName: READ_RECEIPTS_TABLE,
-          FilterExpression: "conversationId = :cid AND messageId = :mid",
-          ExpressionAttributeValues: {
-            ":cid": conversationId,
-            ":mid": String(messageId),
-          },
-        })
-      );
-      return scanResult.Items || [];
-    } catch (scanError) {
-      console.error(`[readReceipts] Scan fallback also failed:`, scanError.message);
-      return [];
-    }
+    console.error(`[readReceipts] Error getting receipts for message:`, error.message);
+    return [];
   }
 }
 
@@ -127,49 +129,26 @@ async function getUserLastReadMessage(conversationId, userId) {
   }
 
   try {
-    // Query by userId index to find all receipts for this user in this conversation
-    const result = await ddbDocClient.send(
-      new QueryCommand({
-        TableName: READ_RECEIPTS_TABLE,
-        IndexName: "userId-index",
-        KeyConditionExpression: "userId = :uid",
-        FilterExpression: "conversationId = :cid",
-        ExpressionAttributeValues: {
-          ":uid": String(userId),
-          ":cid": conversationId,
-        },
-        ScanIndexForward: false, // Most recent first
-        Limit: 1,
-      })
+    const [rows] = await pool.query(
+      `SELECT conversation_id, message_id, user_id, read_at
+       FROM read_receipts
+       WHERE conversation_id = ? AND user_id = ?
+       ORDER BY read_at DESC
+       LIMIT 1`,
+      [conversationId, String(userId)],
     );
 
-    if (result.Items && result.Items.length > 0) {
-      return result.Items[0];
-    }
-    return null;
+    if (!rows[0]) return null;
+
+    return {
+      conversationId: rows[0].conversation_id,
+      messageId: rows[0].message_id,
+      userId: rows[0].user_id,
+      readAt: rows[0].read_at,
+    };
   } catch (error) {
-    console.warn(`[readReceipts] Error getting last read message (Index failed), trying scan:`, error.message);
-    try {
-      const scanResult = await ddbDocClient.send(
-        new ScanCommand({
-          TableName: READ_RECEIPTS_TABLE,
-          FilterExpression: "userId = :uid AND conversationId = :cid",
-          ExpressionAttributeValues: {
-            ":uid": String(userId),
-            ":cid": conversationId,
-          },
-        })
-      );
-      
-      if (scanResult.Items && scanResult.Items.length > 0) {
-        const sorted = scanResult.Items.sort((a, b) => new Date(b.readAt) - new Date(a.readAt));
-        return sorted[0];
-      }
-      return null;
-    } catch (scanError) {
-      console.error(`[readReceipts] Scan fallback failed for last read:`, scanError.message);
-      return null;
-    }
+    console.error(`[readReceipts] Error getting last read message:`, error.message);
+    return null;
   }
 }
 
@@ -185,24 +164,12 @@ async function hasUserReadMessage(conversationId, messageId, userId) {
   }
 
   try {
-    const result = await ddbDocClient.send(
-      new GetCommand({
-        TableName: READ_RECEIPTS_TABLE,
-        Key: {
-          conversationId,
-          messageId: String(messageId),
-        },
-      })
+    const [rows] = await pool.query(
+      "SELECT 1 FROM read_receipts WHERE conversation_id = ? AND message_id = ? AND user_id = ? LIMIT 1",
+      [conversationId, String(messageId), String(userId)],
     );
 
-    // Check if this specific receipt exists
-    if (result.Item) {
-      return result.Item.userId === String(userId);
-    }
-
-    // If no exact match, check all receipts for this message
-    const receipts = await getReadReceiptsForMessage(conversationId, messageId);
-    return receipts.some((r) => String(r.userId) === String(userId));
+    return rows.length > 0;
   } catch (error) {
     console.warn(`[readReceipts] Error checking read status:`, error.message);
     return false;

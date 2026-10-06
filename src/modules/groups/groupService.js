@@ -1,12 +1,7 @@
-const { ddbDocClient } = require('../../config/awsConfig');
-const { PutCommand, GetCommand, ScanCommand, UpdateCommand, QueryCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
+const { pool } = require('../../config/mysqlConfig');
 const crypto = require('crypto');
 
 const { onlineUsers } = require('../../socket/socketUserRegistry');
-
-const GROUPS_TABLE = process.env.DDB_GROUPS_TABLE || 'ott_groups';
-const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || 'ott_group_members';
-const REQUESTS_TABLE = process.env.DDB_GROUP_REQUESTS_TABLE || 'ott_group_requests';
 
 function getActiveIO() {
   return require('../../socket/socketHandler').getIO();
@@ -41,30 +36,27 @@ async function checkUserInGroup(groupId, userId) {
   const userKey = String(userId || '').trim();
   if (!groupKey || !userKey) return false;
 
-  const memberRes = await ddbDocClient.send(new GetCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: userKey }
-  }));
+  const [rows] = await pool.query(
+    'SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1',
+    [groupKey, userKey]
+  );
 
-  return !!memberRes.Item;
+  return rows.length > 0;
 }
 
 async function cleanupGroupIfEmpty(groupId) {
   const groupKey = String(groupId || '').trim();
   if (!groupKey) return false;
 
-  const membersRes = await ddbDocClient.send(new QueryCommand({
-    TableName: MEMBERS_TABLE,
-    KeyConditionExpression: 'groupId = :gid',
-    ExpressionAttributeValues: { ':gid': groupKey }
-  }));
+  const [rows] = await pool.query(
+    'SELECT COUNT(*) AS cnt FROM group_members WHERE group_id = ?',
+    [groupKey]
+  );
+  const count = rows[0] ? Number(rows[0].cnt) : 0;
 
-  if ((membersRes.Items || []).length > 0) return false;
+  if (count > 0) return false;
 
-  await ddbDocClient.send(new DeleteCommand({
-    TableName: GROUPS_TABLE,
-    Key: { groupId: groupKey }
-  }));
+  await pool.query('DELETE FROM groups_ WHERE group_id = ?', [groupKey]);
 
   const io = getActiveIO();
   if (io) {
@@ -84,14 +76,14 @@ async function createGroup(payload) {
   }
 
   const now = new Date().toISOString();
-  // groupId là khoá chính (string) trong DynamoDB
+  // groupId là khoá chính (string)
   const groupId = `group_${Date.now()}`;
 
   const ownerId = payload.ownerId || payload.createdBy || null;
   const userIds = Array.isArray(payload.userIds) ? payload.userIds.filter(u => u && String(u) !== String(ownerId)) : [];
 
   const groupItem = {
-    groupId, // primary key DynamoDB
+    groupId,
     name: payload.name,
     description: payload.description || '',
     avatar_url: null,
@@ -105,55 +97,68 @@ async function createGroup(payload) {
     spamFilterLevel: payload.spamFilterLevel !== undefined ? payload.spamFilterLevel : 1 // 0: Tắt, 1: Vừa, 2: Gắt gao
   };
 
-  await ddbDocClient.send(new PutCommand({
-    TableName: GROUPS_TABLE,
-    Item: groupItem
-  }));
+  // Transaction: group INSERT + all member INSERTs atomically. A crash mid-way
+  // now rolls back fully instead of leaving a group with partial membership.
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
 
-  if (ownerId) {
-    // Bảng thành viên nhóm dạng (group_id, user_id, role)
-    await ddbDocClient.send(new PutCommand({
-      TableName: MEMBERS_TABLE,
-      Item: {
-        groupId,
-        userId: ownerId,
-        role: 'OWNER',
-        joined_at: now
-      }
-    }));
-  }
+    await connection.query(
+      `INSERT INTO groups_ (group_id, name, description, avatar_url, type, member_count, created_by, invite_code, is_approval_required, allow_send_links, spam_filter_level, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        groupItem.groupId,
+        groupItem.name,
+        groupItem.description,
+        groupItem.avatar_url,
+        groupItem.type,
+        groupItem.member_count,
+        groupItem.created_by,
+        groupItem.inviteCode,
+        0,
+        groupItem.allowSendLinks,
+        groupItem.spamFilterLevel,
+        now,
+        now
+      ]
+    );
 
-  // Thêm các user khác từ mảng userIds
-  if (userIds.length > 0) {
-    for (const uid of userIds) {
-      await ddbDocClient.send(new PutCommand({
-        TableName: MEMBERS_TABLE,
-        Item: {
-          groupId,
-          userId: String(uid),
-          role: 'MEMBER',
-          joined_at: now
-        }
-      }));
+    if (ownerId) {
+      await connection.query(
+        'INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)',
+        [groupId, String(ownerId), 'OWNER', now]
+      );
     }
+
+    for (const uid of userIds) {
+      await connection.query(
+        'INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)',
+        [groupId, String(uid), 'MEMBER', now]
+      );
+    }
+
+    await connection.commit();
+  } catch (err) {
+    await connection.rollback();
+    throw err;
+  } finally {
+    connection.release();
   }
 
   return groupItem;
 }
 
 async function listGroups() {
-  const result = await ddbDocClient.send(new ScanCommand({
-    TableName: GROUPS_TABLE
-  }));
+  const [rows] = await pool.query('SELECT * FROM groups_');
 
-  const rows = (result.Items || []).sort((a, b) => {
-    const aTime = a.created_at || a.createdAt || '';
-    const bTime = b.created_at || b.createdAt || '';
+  const sorted = rows.slice().sort((a, b) => {
+    const aTime = a.created_at || '';
+    const bTime = b.created_at || '';
     return bTime.localeCompare(aTime);
   });
 
-  return rows.map((g) => ({
-    groupId: g.groupId,
+  return sorted.map((g) => ({
+    groupId: g.group_id,
     name: g.name,
     description: g.description,
     topic: g.type,
@@ -161,23 +166,19 @@ async function listGroups() {
     memberCount: g.member_count,
     createdBy: g.created_by,
     createdAt: g.created_at,
-    isApprovalRequired: !!g.isApprovalRequired,
-    allowSendLinks: g.allowSendLinks || 'ALL',
-    spamFilterLevel: g.spamFilterLevel !== undefined ? g.spamFilterLevel : 1
+    isApprovalRequired: !!g.is_approval_required,
+    allowSendLinks: g.allow_send_links || 'ALL',
+    spamFilterLevel: g.spam_filter_level !== undefined && g.spam_filter_level !== null ? g.spam_filter_level : 1
   }));
 }
 
 async function getGroupById(groupId) {
-  const result = await ddbDocClient.send(new GetCommand({
-    TableName: GROUPS_TABLE,
-    Key: { groupId: String(groupId) }
-  }));
-
-  if (!result.Item) return null;
-  const g = result.Item;
+  const [rows] = await pool.query('SELECT * FROM groups_ WHERE group_id = ? LIMIT 1', [String(groupId)]);
+  const g = rows[0];
+  if (!g) return null;
 
   return {
-    groupId: g.groupId,
+    groupId: g.group_id,
     name: g.name,
     description: g.description,
     topic: g.type,
@@ -185,10 +186,10 @@ async function getGroupById(groupId) {
     memberCount: g.member_count,
     createdBy: g.created_by,
     createdAt: g.created_at,
-    isApprovalRequired: !!g.isApprovalRequired,
-    pinnedMessages: g.pinnedMessages || [],
-    allowSendLinks: g.allowSendLinks || 'ALL',
-    spamFilterLevel: g.spamFilterLevel !== undefined ? g.spamFilterLevel : 1
+    isApprovalRequired: !!g.is_approval_required,
+    pinnedMessages: g.pinned_messages || [],
+    allowSendLinks: g.allow_send_links || 'ALL',
+    spamFilterLevel: g.spam_filter_level !== undefined && g.spam_filter_level !== null ? g.spam_filter_level : 1
   };
 }
 
@@ -197,15 +198,11 @@ async function addMemberToGroup(groupId, userId, role = 'member') {
   const groupKey = String(groupId);
   const userKey = String(userId);
 
-  await ddbDocClient.send(new PutCommand({
-    TableName: MEMBERS_TABLE,
-    Item: {
-      groupId: groupKey,
-      userId: userKey,
-      role,
-      joined_at: now
-    }
-  }));
+  await pool.query(
+    `INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE role = VALUES(role), joined_at = VALUES(joined_at)`,
+    [groupKey, userKey, role, now]
+  );
 
   return { groupId: groupKey, userId: userKey, role };
 }
@@ -214,25 +211,19 @@ async function addMembersToGroup(groupId, requestUserId, userIds) {
   const groupKey = String(groupId);
   const reqUserKey = String(requestUserId);
 
-  const reqMemberRes = await ddbDocClient.send(new GetCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: reqUserKey }
-  }));
-  const reqMember = reqMemberRes.Item;
+  const [reqRows] = await pool.query(
+    'SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1',
+    [groupKey, reqUserKey]
+  );
 
-  if (!reqMember) {
+  if (!reqRows.length) {
     const err = new Error('403 Forbidden: You are not a member of this group');
     err.status = 403;
     throw err;
   }
 
-  const membersRes = await ddbDocClient.send(new QueryCommand({
-    TableName: MEMBERS_TABLE,
-    KeyConditionExpression: 'groupId = :gid',
-    ExpressionAttributeValues: { ':gid': groupKey }
-  }));
-  const currentMembers = membersRes.Items || [];
-  const existingUserIds = currentMembers.map(m => m.userId);
+  const [currentMembers] = await pool.query('SELECT user_id FROM group_members WHERE group_id = ?', [groupKey]);
+  const existingUserIds = currentMembers.map(m => m.user_id);
 
   const newMembers = (Array.isArray(userIds) ? userIds : []).filter(uid => uid && !existingUserIds.includes(String(uid)) && String(uid) !== reqUserKey);
 
@@ -240,25 +231,17 @@ async function addMembersToGroup(groupId, requestUserId, userIds) {
   const newMemberObjects = [];
 
   for (const uid of newMembers) {
-    await ddbDocClient.send(new PutCommand({
-      TableName: MEMBERS_TABLE,
-      Item: {
-        groupId: groupKey,
-        userId: String(uid),
-        role: 'MEMBER',
-        joined_at: now
-      }
-    }));
+    await pool.query(
+      'INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)',
+      [groupKey, String(uid), 'MEMBER', now]
+    );
 
     // Lấy thông tin user
-    const uRes = await ddbDocClient.send(new GetCommand({
-      TableName: process.env.DDB_USERS_TABLE || 'ott_users',
-      Key: { userId: String(uid) }
-    }));
-    const u = uRes.Item || {};
+    const [uRows] = await pool.query('SELECT * FROM users WHERE user_id = ? LIMIT 1', [String(uid)]);
+    const u = uRows[0] || {};
     newMemberObjects.push({
       userId: String(uid),
-      displayName: u.display_name || u.full_name || u.username || String(uid),
+      displayName: u.display_name || u.username || String(uid),
       username: u.username || u.display_name || String(uid),
       avatarUrl: u.avatar_url || null,
       role: 'MEMBER',
@@ -267,12 +250,7 @@ async function addMembersToGroup(groupId, requestUserId, userIds) {
   }
 
   if (newMembers.length > 0) {
-    await ddbDocClient.send(new UpdateCommand({
-      TableName: GROUPS_TABLE,
-      Key: { groupId: groupKey },
-      UpdateExpression: 'SET member_count = if_not_exists(member_count, :zero) + :inc',
-      ExpressionAttributeValues: { ':inc': newMembers.length, ':zero': 0 }
-    }));
+    await pool.query('UPDATE groups_ SET member_count = member_count + ? WHERE group_id = ?', [newMembers.length, groupKey]);
 
     // NOTE: socket emit 'group:members_added' is handled by groupController.addMembers
     // to ensure only 1 emit with full payload (including groupData). No emit here to avoid duplication.
@@ -292,11 +270,8 @@ async function kickMember(groupId, requestUserId, targetUserId) {
     throw err;
   }
 
-  const reqMemberRes = await ddbDocClient.send(new GetCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: reqUserKey }
-  }));
-  const reqMember = reqMemberRes.Item;
+  const [reqRows] = await pool.query('SELECT role FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1', [groupKey, reqUserKey]);
+  const reqMember = reqRows[0];
 
   if (!reqMember) {
     const err = new Error('403 Forbidden: You are not in this group');
@@ -311,11 +286,8 @@ async function kickMember(groupId, requestUserId, targetUserId) {
     throw err;
   }
 
-  const targetMemberRes = await ddbDocClient.send(new GetCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: targetKey }
-  }));
-  const targetMember = targetMemberRes.Item;
+  const [targetRows] = await pool.query('SELECT role FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1', [groupKey, targetKey]);
+  const targetMember = targetRows[0];
 
   if (!targetMember) {
     const err = new Error('404 Not Found: Target user is not in the group');
@@ -330,17 +302,10 @@ async function kickMember(groupId, requestUserId, targetUserId) {
     throw err;
   }
 
-  await ddbDocClient.send(new DeleteCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: targetKey }
-  }));
+  await pool.query('DELETE FROM group_members WHERE group_id = ? AND user_id = ?', [groupKey, targetKey]);
 
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: GROUPS_TABLE,
-    Key: { groupId: groupKey },
-    UpdateExpression: 'SET member_count = member_count - :dec',
-    ExpressionAttributeValues: { ':dec': 1 }
-  }));
+  // NOTE: non-conditional decrement, no floor-at-zero guard — preserved from the original behavior.
+  await pool.query('UPDATE groups_ SET member_count = member_count - ? WHERE group_id = ?', [1, groupKey]);
 
   forceLeaveGroup(targetKey, groupKey);
   await cleanupGroupIfEmpty(groupKey);
@@ -360,11 +325,8 @@ async function updateRole(groupId, requestUserId, targetUserId, newRole) {
     throw err;
   }
 
-  const reqMemberRes = await ddbDocClient.send(new GetCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: reqUserKey }
-  }));
-  const reqMember = reqMemberRes.Item;
+  const [reqRows] = await pool.query('SELECT role FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1', [groupKey, reqUserKey]);
+  const reqMember = reqRows[0];
 
   if (!reqMember || (reqMember.role || '').toUpperCase() !== 'OWNER') {
     const err = new Error('403 Forbidden: Only OWNER can update roles');
@@ -372,11 +334,8 @@ async function updateRole(groupId, requestUserId, targetUserId, newRole) {
     throw err;
   }
 
-  const targetMemberRes = await ddbDocClient.send(new GetCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: targetKey }
-  }));
-  const targetMember = targetMemberRes.Item;
+  const [targetRows] = await pool.query('SELECT role FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1', [groupKey, targetKey]);
+  const targetMember = targetRows[0];
 
   if (!targetMember) {
     const err = new Error('404 Not Found: Target user is not in the group');
@@ -390,13 +349,7 @@ async function updateRole(groupId, requestUserId, targetUserId, newRole) {
     throw err;
   }
 
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: targetKey },
-    UpdateExpression: 'SET #r = :roleVal',
-    ExpressionAttributeNames: { '#r': 'role' },
-    ExpressionAttributeValues: { ':roleVal': roleUpper }
-  }));
+  await pool.query('UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?', [roleUpper, groupKey, targetKey]);
 
   const io = getActiveIO();
   if (io) {
@@ -414,11 +367,8 @@ async function leaveGroup(groupId, requestUserId, newOwnerId = null) {
   const groupKey = String(groupId);
   const reqUserKey = String(requestUserId);
 
-  const reqMemberRes = await ddbDocClient.send(new GetCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: reqUserKey }
-  }));
-  const reqMember = reqMemberRes.Item;
+  const [reqRows] = await pool.query('SELECT role FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1', [groupKey, reqUserKey]);
+  const reqMember = reqRows[0];
 
   if (!reqMember) {
     const err = new Error('404 Not Found: You are not a member of this group');
@@ -427,12 +377,7 @@ async function leaveGroup(groupId, requestUserId, newOwnerId = null) {
   }
 
   // Get all members to check count
-  const allMembersRes = await ddbDocClient.send(new QueryCommand({
-    TableName: MEMBERS_TABLE,
-    KeyConditionExpression: 'groupId = :gid',
-    ExpressionAttributeValues: { ':gid': groupKey }
-  }));
-  const allMembers = allMembersRes.Items || [];
+  const [allMembers] = await pool.query('SELECT user_id, role FROM group_members WHERE group_id = ?', [groupKey]);
 
   if ((reqMember.role || '').toUpperCase() === 'OWNER') {
     if (allMembers.length > 1) {
@@ -441,9 +386,9 @@ async function leaveGroup(groupId, requestUserId, newOwnerId = null) {
         err.status = 400;
         throw err;
       }
-      
+
       const newOwnerKey = String(newOwnerId);
-      const newOwner = allMembers.find(m => m.userId === newOwnerKey);
+      const newOwner = allMembers.find(m => m.user_id === newOwnerKey);
       if (!newOwner) {
         const err = new Error('Người được chọn làm Trưởng nhóm mới không có trong nhóm');
         err.status = 400;
@@ -451,22 +396,11 @@ async function leaveGroup(groupId, requestUserId, newOwnerId = null) {
       }
 
       // Promote new owner
-      await ddbDocClient.send(new UpdateCommand({
-        TableName: MEMBERS_TABLE,
-        Key: { groupId: groupKey, userId: newOwnerKey },
-        UpdateExpression: 'SET #role = :roleVal',
-        ExpressionAttributeNames: { '#role': 'role' },
-        ExpressionAttributeValues: { ':roleVal': 'OWNER' }
-      }));
-      
-      // Update creator in GROUPS_TABLE
-      await ddbDocClient.send(new UpdateCommand({
-        TableName: GROUPS_TABLE,
-        Key: { groupId: groupKey },
-        UpdateExpression: 'SET created_by = :newOwner',
-        ExpressionAttributeValues: { ':newOwner': newOwnerKey }
-      }));
-      
+      await pool.query('UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?', ['OWNER', groupKey, newOwnerKey]);
+
+      // Update creator in groups_ table
+      await pool.query('UPDATE groups_ SET created_by = ? WHERE group_id = ?', [newOwnerKey, groupKey]);
+
       // Emit event owner_transferred
       const io = getActiveIO();
       if (io) {
@@ -480,17 +414,10 @@ async function leaveGroup(groupId, requestUserId, newOwnerId = null) {
     }
   }
 
-  await ddbDocClient.send(new DeleteCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: reqUserKey }
-  }));
+  await pool.query('DELETE FROM group_members WHERE group_id = ? AND user_id = ?', [groupKey, reqUserKey]);
 
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: GROUPS_TABLE,
-    Key: { groupId: groupKey },
-    UpdateExpression: 'SET member_count = member_count - :dec',
-    ExpressionAttributeValues: { ':dec': 1 }
-  }));
+  // NOTE: non-conditional decrement, no floor-at-zero guard — preserved from the original behavior.
+  await pool.query('UPDATE groups_ SET member_count = member_count - ? WHERE group_id = ?', [1, groupKey]);
 
   forceLeaveGroup(reqUserKey, groupKey);
   await cleanupGroupIfEmpty(groupKey);
@@ -501,43 +428,26 @@ async function leaveGroup(groupId, requestUserId, newOwnerId = null) {
 async function getGroupsForUser(userId) {
   const userKey = String(userId);
 
-  const membersRes = await ddbDocClient.send(new ScanCommand({
-    TableName: MEMBERS_TABLE,
-    FilterExpression: 'userId = :uid',
-    ExpressionAttributeValues: { ':uid': userKey }
-  }));
-
-  const memberItems = membersRes.Items || [];
-  if (!memberItems.length) return [];
-
-  const groupIds = [...new Set(memberItems.map((m) => m.groupId))];
-  const groups = await Promise.all(
-    groupIds.map(async (gid) => {
-      if (!gid) return null; // Bỏ qua nếu không có ID
-      const res = await ddbDocClient.send(new GetCommand({
-        TableName: GROUPS_TABLE,
-        Key: { groupId: gid }
-      }));
-      return res.Item || null;
-    })
+  // Single JOIN replaces the old Scan-by-userId + N GetItems (N+1) pattern.
+  const [rows] = await pool.query(
+    'SELECT g.* FROM groups_ g JOIN group_members gm ON gm.group_id = g.group_id WHERE gm.user_id = ?',
+    [userKey]
   );
 
-  return groups
-    .filter(Boolean)
-    .map((g) => ({
-      groupId: g.groupId,
-      name: g.name,
-      description: g.description,
-      topic: g.type,
-      avatarUrl: g.avatar_url,
-      memberCount: g.member_count,
-      createdBy: g.created_by,
-      createdAt: g.created_at,
-      isApprovalRequired: !!g.isApprovalRequired,
-      pinnedMessages: g.pinnedMessages || [],
-      allowSendLinks: g.allowSendLinks || 'ALL',
-      spamFilterLevel: g.spamFilterLevel !== undefined ? g.spamFilterLevel : 1
-    }));
+  return rows.map((g) => ({
+    groupId: g.group_id,
+    name: g.name,
+    description: g.description,
+    topic: g.type,
+    avatarUrl: g.avatar_url,
+    memberCount: g.member_count,
+    createdBy: g.created_by,
+    createdAt: g.created_at,
+    isApprovalRequired: !!g.is_approval_required,
+    pinnedMessages: g.pinned_messages || [],
+    allowSendLinks: g.allow_send_links || 'ALL',
+    spamFilterLevel: g.spam_filter_level !== undefined && g.spam_filter_level !== null ? g.spam_filter_level : 1
+  }));
 }
 
 async function getGroupMembers(groupId) {
@@ -546,51 +456,28 @@ async function getGroupMembers(groupId) {
     throw new Error('Group ID is required');
   }
 
-  const membersRes = await ddbDocClient.send(new QueryCommand({
-    TableName: MEMBERS_TABLE,
-    KeyConditionExpression: 'groupId = :gid',
-    ExpressionAttributeValues: {
-      ':gid': groupKey,
-    },
-  }));
-  
-  console.log('--- KẾT QUẢ QUERY MEMBERS ---', membersRes.Items);
-
-  const members = membersRes.Items || [];
-  if (!members.length) return [];
-
-  const userProfiles = await Promise.all(
-    members.map(async (member) => {
-      const uid = String(member.userId || '');
-      if (!uid) {
-        return {
-          userId: '',
-          displayName: 'Unknown user',
-          username: 'unknown',
-          avatarUrl: null,
-          role: member.role || 'member',
-          joinedAt: member.joined_at || null,
-        };
-      }
-
-      const userRes = await ddbDocClient.send(new GetCommand({
-        TableName: process.env.DDB_USERS_TABLE || 'ott_users',
-        Key: { userId: uid },
-      }));
-
-      const u = userRes.Item || {};
-      return {
-        userId: uid,
-        displayName: u.display_name || u.full_name || u.username || uid,
-        username: u.username || u.display_name || uid,
-        avatarUrl: u.avatar_url || null,
-        role: member.role || 'member',
-        joinedAt: member.joined_at || null,
-      };
-    })
+  // Single JOIN against users replaces the old Query + N GetItems (N+1) pattern.
+  const [rows] = await pool.query(
+    `SELECT gm.user_id, gm.role, gm.joined_at, u.display_name, u.username, u.avatar_url
+     FROM group_members gm
+     LEFT JOIN users u ON u.user_id = gm.user_id
+     WHERE gm.group_id = ?`,
+    [groupKey]
   );
 
-  return userProfiles;
+  if (!rows.length) return [];
+
+  return rows.map((row) => {
+    const uid = String(row.user_id || '');
+    return {
+      userId: uid,
+      displayName: row.display_name || row.username || uid,
+      username: row.username || row.display_name || uid,
+      avatarUrl: row.avatar_url || null,
+      role: row.role || 'member',
+      joinedAt: row.joined_at || null,
+    };
+  });
 }
 
 async function getInviteLink(groupId) {
@@ -599,12 +486,8 @@ async function getInviteLink(groupId) {
     throw new Error('Group not found');
   }
 
-  const result = await ddbDocClient.send(new GetCommand({
-    TableName: GROUPS_TABLE,
-    Key: { groupId: String(groupId) }
-  }));
-
-  const inviteCode = result.Item.inviteCode;
+  const [rows] = await pool.query('SELECT invite_code FROM groups_ WHERE group_id = ? LIMIT 1', [String(groupId)]);
+  const inviteCode = rows[0] ? rows[0].invite_code : null;
   const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3000';
   const inviteLink = `${baseUrl}/join/${inviteCode}`;
 
@@ -613,7 +496,7 @@ async function getInviteLink(groupId) {
 
 function mapGroupItem(g) {
   return {
-    groupId: g.groupId,
+    groupId: g.group_id,
     name: g.name,
     description: g.description,
     topic: g.type,
@@ -621,10 +504,10 @@ function mapGroupItem(g) {
     memberCount: g.member_count,
     createdBy: g.created_by,
     createdAt: g.created_at,
-    isApprovalRequired: !!g.isApprovalRequired,
-    inviteCode: g.inviteCode,
-    allowSendLinks: g.allowSendLinks || 'ALL',
-    spamFilterLevel: g.spamFilterLevel !== undefined ? g.spamFilterLevel : 1
+    isApprovalRequired: !!g.is_approval_required,
+    inviteCode: g.invite_code,
+    allowSendLinks: g.allow_send_links || 'ALL',
+    spamFilterLevel: g.spam_filter_level !== undefined && g.spam_filter_level !== null ? g.spam_filter_level : 1
   };
 }
 
@@ -634,49 +517,33 @@ async function getGroupByInviteCode(inviteCode) {
     throw new Error('Invalid invite code');
   }
 
-  const scanRes = await ddbDocClient.send(new ScanCommand({
-    TableName: GROUPS_TABLE,
-    FilterExpression: 'inviteCode = :code',
-    ExpressionAttributeValues: { ':code': normalizedCode }
-  }));
+  const [rows] = await pool.query('SELECT * FROM groups_ WHERE invite_code = ? LIMIT 1', [normalizedCode]);
 
-  if (!scanRes.Items || scanRes.Items.length === 0) {
+  if (!rows.length) {
     throw new Error('Invalid invite code or group not found');
   }
 
-  return mapGroupItem(scanRes.Items[0]);
+  return mapGroupItem(rows[0]);
 }
 
 async function joinGroupByInviteCode(userId, inviteCode) {
-  // Normalize inviteCode to lowercase to match DynamoDB storage (generated via crypto.randomBytes)
+  // Normalize inviteCode to lowercase to match storage (generated via crypto.randomBytes)
   const normalizedCode = String(inviteCode).trim().toLowerCase();
 
-  // Tìm nhóm qua inviteCode — dùng Scan thay vì Query vì bảng chưa có GSI inviteCode-index
-  const scanRes = await ddbDocClient.send(new ScanCommand({
-    TableName: GROUPS_TABLE,
-    FilterExpression: 'inviteCode = :code',
-    ExpressionAttributeValues: { ':code': normalizedCode }
-  }));
+  const [rows] = await pool.query('SELECT * FROM groups_ WHERE invite_code = ? LIMIT 1', [normalizedCode]);
 
-  if (!scanRes.Items || scanRes.Items.length === 0) {
+  if (!rows.length) {
     throw new Error('Invalid invite code or group not found');
   }
 
-  const group = scanRes.Items[0];
-  const groupId = group.groupId;
+  const group = rows[0];
+  const groupId = group.group_id;
   const userKey = String(userId);
-  const needsApproval = group.isApprovalRequired || false;
+  const needsApproval = !!group.is_approval_required;
 
-  const memberCheck = await ddbDocClient.send(new ScanCommand({
-    TableName: MEMBERS_TABLE,
-    FilterExpression: 'groupId = :gid AND userId = :uid',
-    ExpressionAttributeValues: {
-      ':gid': groupId,
-      ':uid': userKey
-    }
-  }));
+  const [memberRows] = await pool.query('SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1', [groupId, userKey]);
 
-  if (memberCheck.Items && memberCheck.Items.length > 0) {
+  if (memberRows.length > 0) {
     throw new Error('User is already a member of this group');
   }
 
@@ -687,24 +554,13 @@ async function joinGroupByInviteCode(userId, inviteCode) {
 
   await addMemberToGroup(groupId, userKey, 'MEMBER');
 
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: GROUPS_TABLE,
-    Key: { groupId },
-    UpdateExpression: 'SET member_count = if_not_exists(member_count, :zero) + :inc',
-    ExpressionAttributeValues: {
-      ':inc': 1,
-      ':zero': 0
-    }
-  }));
+  await pool.query('UPDATE groups_ SET member_count = member_count + ? WHERE group_id = ?', [1, groupId]);
 
-  const uRes = await ddbDocClient.send(new GetCommand({
-    TableName: process.env.DDB_USERS_TABLE || 'ott_users',
-    Key: { userId: userKey }
-  }));
-  const u = uRes.Item || {};
+  const [uRows] = await pool.query('SELECT * FROM users WHERE user_id = ? LIMIT 1', [userKey]);
+  const u = uRows[0] || {};
   const newMemberObj = {
     userId: userKey,
-    displayName: u.display_name || u.full_name || u.username || userKey,
+    displayName: u.display_name || u.username || userKey,
     username: u.username || u.display_name || userKey,
     avatarUrl: u.avatar_url || null,
     role: 'MEMBER',
@@ -714,7 +570,6 @@ async function joinGroupByInviteCode(userId, inviteCode) {
   forceJoinGroup(userKey, groupId);
   const io = getActiveIO();
   if (io) {
-    console.log(`[joinGroupByInviteCode] 📡 EMIT group:members_added → room=${groupId}, user=${userKey}`);
     io.to(groupId).emit('group:members_added', {
       groupId,
       newMembers: [newMemberObj],
@@ -729,11 +584,8 @@ async function updateGroupSettings(groupId, requestUserId, settings) {
   const groupKey = String(groupId);
   const reqUserKey = String(requestUserId);
 
-  const reqMemberRes = await ddbDocClient.send(new GetCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: reqUserKey }
-  }));
-  const reqMember = reqMemberRes.Item;
+  const [reqRows] = await pool.query('SELECT role FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1', [groupKey, reqUserKey]);
+  const reqMember = reqRows[0];
 
   if (!reqMember || (reqMember.role !== 'OWNER' && reqMember.role !== 'owner')) {
     const err = new Error('403 Forbidden: Only OWNER can update settings');
@@ -741,15 +593,13 @@ async function updateGroupSettings(groupId, requestUserId, settings) {
     throw err;
   }
 
-  let updateExpr = 'SET ';
-  const exprValues = {};
-  const exprNames = {};
+  const setClauses = [];
+  const values = [];
   let changed = false;
 
   if (settings.isApprovalRequired !== undefined) {
-    updateExpr += '#isAppReq = :isAppReq, ';
-    exprNames['#isAppReq'] = 'isApprovalRequired';
-    exprValues[':isAppReq'] = Boolean(settings.isApprovalRequired);
+    setClauses.push('is_approval_required = ?');
+    values.push(Boolean(settings.isApprovalRequired) ? 1 : 0);
     changed = true;
   }
 
@@ -760,52 +610,42 @@ async function updateGroupSettings(groupId, requestUserId, settings) {
       err.status = 400;
       throw err;
     }
-    updateExpr += '#name = :name, ';
-    exprNames['#name'] = 'name';
-    exprValues[':name'] = name;
+    setClauses.push('name = ?');
+    values.push(name);
     changed = true;
   }
 
   if (settings.description !== undefined) {
-    updateExpr += '#description = :description, ';
-    exprNames['#description'] = 'description';
-    exprValues[':description'] = String(settings.description || '');
+    setClauses.push('description = ?');
+    values.push(String(settings.description || ''));
     changed = true;
   }
 
   const nextAvatarUrl = settings.avatarUrl !== undefined ? settings.avatarUrl : settings.avatar_url;
   if (nextAvatarUrl !== undefined) {
-    updateExpr += '#avatarUrl = :avatarUrl, ';
-    exprNames['#avatarUrl'] = 'avatar_url';
-    exprValues[':avatarUrl'] = nextAvatarUrl || null;
+    setClauses.push('avatar_url = ?');
+    values.push(nextAvatarUrl || null);
     changed = true;
   }
 
   if (settings.allowSendLinks !== undefined) {
-    updateExpr += '#allowSend = :allowSend, ';
-    exprNames['#allowSend'] = 'allowSendLinks';
-    exprValues[':allowSend'] = String(settings.allowSendLinks);
+    setClauses.push('allow_send_links = ?');
+    values.push(String(settings.allowSendLinks));
     changed = true;
   }
 
   if (settings.spamFilterLevel !== undefined) {
-    updateExpr += '#spamLvl = :spamLvl, ';
-    exprNames['#spamLvl'] = 'spamFilterLevel';
-    exprValues[':spamLvl'] = Number(settings.spamFilterLevel);
+    setClauses.push('spam_filter_level = ?');
+    values.push(Number(settings.spamFilterLevel));
     changed = true;
   }
 
-  // Bỏ dấu phẩy thừa ở cuối
-  updateExpr = updateExpr.replace(/, $/, '');
-
   if (changed) {
-    await ddbDocClient.send(new UpdateCommand({
-      TableName: GROUPS_TABLE,
-      Key: { groupId: groupKey },
-      UpdateExpression: updateExpr,
-      ExpressionAttributeNames: exprNames,
-      ExpressionAttributeValues: exprValues
-    }));
+    setClauses.push('updated_at = ?');
+    values.push(new Date().toISOString());
+    values.push(groupKey);
+
+    await pool.query(`UPDATE groups_ SET ${setClauses.join(', ')} WHERE group_id = ?`, values);
 
     const io = getActiveIO();
     if (io) {
@@ -828,46 +668,29 @@ async function updateGroupSettings(groupId, requestUserId, settings) {
 
 async function debugGetMembers(userId) {
   const userKey = String(userId);
-  const result = await ddbDocClient.send(new ScanCommand({
-    TableName: MEMBERS_TABLE,
-    FilterExpression: 'userId = :uid',
-    ExpressionAttributeValues: { ':uid': userKey }
-  }));
-  return result.Items || [];
+  const [rows] = await pool.query('SELECT group_id, user_id, role, joined_at FROM group_members WHERE user_id = ?', [userKey]);
+  return rows.map(r => ({ groupId: r.group_id, userId: r.user_id, role: r.role, joined_at: r.joined_at }));
 }
 
 async function disbandGroup(groupId, requestUserId) {
   const groupKey = String(groupId);
   const userKey = String(requestUserId);
 
-  const membersRes = await ddbDocClient.send(new QueryCommand({
-    TableName: MEMBERS_TABLE,
-    KeyConditionExpression: 'groupId = :gid',
-    ExpressionAttributeValues: { ':gid': groupKey }
-  }));
-  
-  const members = membersRes.Items || [];
-  const requester = members.find(m => m.userId === userKey);
-  
+  const [members] = await pool.query('SELECT user_id, role FROM group_members WHERE group_id = ?', [groupKey]);
+
+  const requester = members.find(m => m.user_id === userKey);
+
   if (!requester || (requester.role !== 'owner' && requester.role !== 'OWNER')) {
     const error = new Error('403 Forbidden: You are not the OWNER of this group');
     error.status = 403;
     throw error;
   }
-  
+
   // delete members
-  for (const m of members) {
-    await ddbDocClient.send(new DeleteCommand({
-      TableName: MEMBERS_TABLE,
-      Key: { groupId: groupKey, userId: m.userId }
-    }));
-  }
+  await pool.query('DELETE FROM group_members WHERE group_id = ?', [groupKey]);
 
   // Xoá nhóm
-  await ddbDocClient.send(new DeleteCommand({
-    TableName: GROUPS_TABLE,
-    Key: { groupId: groupKey }
-  }));
+  await pool.query('DELETE FROM groups_ WHERE group_id = ?', [groupKey]);
 
   const io = getActiveIO();
   if (io) {
@@ -875,9 +698,9 @@ async function disbandGroup(groupId, requestUserId) {
       groupId: groupKey
     });
   }
-  
+
   for (const m of members) {
-    forceLeaveGroup(m.userId, groupKey);
+    forceLeaveGroup(m.user_id, groupKey);
   }
 
   return { message: 'Group disbanded successfully' };
@@ -889,25 +712,18 @@ async function requestToJoin(groupId, userId) {
   const now = new Date().toISOString();
 
   // Kiểm tra đã là thành viên chưa
-  const memberCheck = await ddbDocClient.send(new GetCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: userKey }
-  }));
-  if (memberCheck.Item) {
+  const [memberRows] = await pool.query('SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1', [groupKey, userKey]);
+  if (memberRows.length > 0) {
     const error = new Error('400 Bad Request: You are already a member');
     error.status = 400;
     throw error;
   }
 
-  await ddbDocClient.send(new PutCommand({
-    TableName: REQUESTS_TABLE,
-    Item: {
-      groupId: groupKey,
-      userId: userKey,
-      status: 'PENDING',
-      createdAt: now
-    }
-  }));
+  await pool.query(
+    `INSERT INTO group_requests (group_id, user_id, status, created_at) VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE status = VALUES(status), created_at = VALUES(created_at)`,
+    [groupKey, userKey, 'PENDING', now]
+  );
 
   const io = getActiveIO();
   if (io) {
@@ -923,29 +739,22 @@ async function requestToJoin(groupId, userId) {
 async function getPendingRequests(groupId) {
   const groupKey = String(groupId);
 
-  const reqsRes = await ddbDocClient.send(new QueryCommand({
-    TableName: REQUESTS_TABLE,
-    KeyConditionExpression: 'groupId = :gid',
-    ExpressionAttributeValues: { ':gid': groupKey }
-  }));
-
-  const requests = reqsRes.Items || [];
-  const pendingReqs = requests.filter(r => r.status === 'PENDING');
+  const [pendingReqs] = await pool.query(
+    "SELECT * FROM group_requests WHERE group_id = ? AND status = 'PENDING'",
+    [groupKey]
+  );
 
   if (!pendingReqs.length) return [];
 
   const profiles = await Promise.all(
     pendingReqs.map(async (req) => {
-      const uRes = await ddbDocClient.send(new GetCommand({
-        TableName: process.env.DDB_USERS_TABLE || 'ott_users',
-        Key: { userId: req.userId }
-      }));
-      const u = uRes.Item || {};
+      const [uRows] = await pool.query('SELECT * FROM users WHERE user_id = ? LIMIT 1', [req.user_id]);
+      const u = uRows[0] || {};
       return {
-        userId: req.userId,
+        userId: req.user_id,
         status: req.status,
-        createdAt: req.createdAt,
-        displayName: u.display_name || u.full_name || u.username || req.userId,
+        createdAt: req.created_at,
+        displayName: u.display_name || u.username || req.user_id,
         avatarUrl: u.avatar_url || null,
       };
     })
@@ -959,11 +768,8 @@ async function handleJoinRequest(groupId, requestUserId, targetUserId, action) {
   const reqUserKey = String(requestUserId);
   const targetKey = String(targetUserId);
 
-  const reqMemberRes = await ddbDocClient.send(new GetCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: reqUserKey }
-  }));
-  const reqMember = reqMemberRes.Item;
+  const [reqRows] = await pool.query('SELECT role FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1', [groupKey, reqUserKey]);
+  const reqMember = reqRows[0];
 
   if (!reqMember || (reqMember.role !== 'OWNER' && reqMember.role !== 'DEPUTY' && reqMember.role !== 'owner' && reqMember.role !== 'deputy')) {
     const error = new Error('403 Forbidden: Only OWNER or DEPUTY can handle requests');
@@ -971,46 +777,32 @@ async function handleJoinRequest(groupId, requestUserId, targetUserId, action) {
     throw error;
   }
 
-  const joinReqRes = await ddbDocClient.send(new GetCommand({
-    TableName: REQUESTS_TABLE,
-    Key: { groupId: groupKey, userId: targetKey }
-  }));
+  const [joinReqRows] = await pool.query('SELECT * FROM group_requests WHERE group_id = ? AND user_id = ? LIMIT 1', [groupKey, targetKey]);
 
-  if (!joinReqRes.Item) {
+  if (!joinReqRows.length) {
     const error = new Error('404 Not Found: Request not found');
     error.status = 404;
     throw error;
   }
 
   if (action === 'APPROVE') {
-    await ddbDocClient.send(new DeleteCommand({
-      TableName: REQUESTS_TABLE,
-      Key: { groupId: groupKey, userId: targetKey }
-    }));
-    
+    await pool.query('DELETE FROM group_requests WHERE group_id = ? AND user_id = ?', [groupKey, targetKey]);
+
     await addMemberToGroup(groupKey, targetKey, 'MEMBER');
 
-    const uRes = await ddbDocClient.send(new GetCommand({
-      TableName: process.env.DDB_USERS_TABLE || 'ott_users',
-      Key: { userId: targetKey }
-    }));
-    const u = uRes.Item || {};
+    const [uRows] = await pool.query('SELECT * FROM users WHERE user_id = ? LIMIT 1', [targetKey]);
+    const u = uRows[0] || {};
     const newMemberObj = {
       userId: targetKey,
-      displayName: u.display_name || u.full_name || u.username || targetKey,
+      displayName: u.display_name || u.username || targetKey,
       username: u.username || u.display_name || targetKey,
       avatarUrl: u.avatar_url || null,
       role: 'MEMBER',
       joinedAt: new Date().toISOString()
     };
 
-    await ddbDocClient.send(new UpdateCommand({
-      TableName: GROUPS_TABLE,
-      Key: { groupId: groupKey },
-      UpdateExpression: 'SET member_count = if_not_exists(member_count, :zero) + :inc',
-      ExpressionAttributeValues: { ':inc': 1, ':zero': 0 }
-    }));
-    
+    await pool.query('UPDATE groups_ SET member_count = member_count + ? WHERE group_id = ?', [1, groupKey]);
+
     forceJoinGroup(targetKey, groupKey);
     const io = getActiveIO();
     if (io) {
@@ -1024,16 +816,75 @@ async function handleJoinRequest(groupId, requestUserId, targetUserId, action) {
     }
     return { message: 'Request approved' };
   } else if (action === 'REJECT') {
-    await ddbDocClient.send(new DeleteCommand({
-      TableName: REQUESTS_TABLE,
-      Key: { groupId: groupKey, userId: targetKey }
-    }));
+    await pool.query('DELETE FROM group_requests WHERE group_id = ? AND user_id = ?', [groupKey, targetKey]);
     return { message: 'Request rejected' };
   } else {
     const error = new Error('400 Bad Request: Invalid action');
     error.status = 400;
     throw error;
   }
+}
+
+async function pinMessage(groupId, message, requestUserId) {
+  const groupKey = String(groupId);
+  const [rows] = await pool.query('SELECT pinned_messages FROM groups_ WHERE group_id = ? LIMIT 1', [groupKey]);
+  const g = rows[0];
+  if (!g) throw new Error('Group not found');
+
+  // Kiểm tra quyền (OWNER/DEPUTY)
+  const [memberRows] = await pool.query('SELECT role FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1', [groupKey, String(requestUserId)]);
+  const member = memberRows[0];
+  if (!member || (member.role !== 'OWNER' && member.role !== 'owner' && member.role !== 'DEPUTY' && member.role !== 'deputy')) {
+    throw new Error('Only OWNER or DEPUTY can pin messages');
+  }
+
+  let pinned = Array.isArray(g.pinned_messages) ? g.pinned_messages : [];
+  pinned = pinned.filter(m => String(m.id) !== String(message.id));
+
+  const pinObj = {
+    ...message,
+    pinnedBy: String(requestUserId),
+    pinnedAt: new Date().toISOString()
+  };
+  pinned.unshift(pinObj);
+
+  await pool.query('UPDATE groups_ SET pinned_messages = ? WHERE group_id = ?', [JSON.stringify(pinned), groupKey]);
+
+  return pinned;
+}
+
+async function unpinMessage(groupId, messageId, requestUserId) {
+  const groupKey = String(groupId);
+  const [rows] = await pool.query('SELECT pinned_messages FROM groups_ WHERE group_id = ? LIMIT 1', [groupKey]);
+  const g = rows[0];
+  if (!g) throw new Error('Group not found');
+
+  // Kiểm tra quyền
+  const [memberRows] = await pool.query('SELECT role FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1', [groupKey, String(requestUserId)]);
+  const member = memberRows[0];
+  if (!member || (member.role !== 'OWNER' && member.role !== 'owner' && member.role !== 'DEPUTY' && member.role !== 'deputy')) {
+    throw new Error('Only OWNER or DEPUTY can unpin messages');
+  }
+
+  let pinned = Array.isArray(g.pinned_messages) ? g.pinned_messages : [];
+
+  // Kiểm tra quyền:
+  // 1. Nếu là OWNER/DEPUTY thì được gỡ mọi ghim
+  // 2. Nếu là MEMBER thì chỉ được gỡ ghim do chính mình tạo
+  const pinToUnpin = pinned.find(m => String(m.id) === String(messageId));
+
+  const isPinner = pinToUnpin && String(pinToUnpin.pinnedBy) === String(requestUserId);
+  const isHighRole = member && (member.role === 'OWNER' || member.role === 'owner' || member.role === 'DEPUTY' || member.role === 'deputy');
+
+  if (pinToUnpin && pinToUnpin.pinnedBy && !isPinner && !isHighRole) {
+    throw new Error('Bạn không có quyền gỡ tin nhắn này');
+  }
+
+  pinned = pinned.filter(m => String(m.id) !== String(messageId));
+
+  await pool.query('UPDATE groups_ SET pinned_messages = ? WHERE group_id = ?', [JSON.stringify(pinned), groupKey]);
+
+  return pinned;
 }
 
 module.exports = {
@@ -1052,7 +903,6 @@ module.exports = {
   getGroupByInviteCode,
   joinGroupByInviteCode,
   debugGetMembers,
-  debugGetMembers,
   disbandGroup,
   requestToJoin,
   getPendingRequests,
@@ -1061,87 +911,3 @@ module.exports = {
   pinMessage,
   unpinMessage,
 };
-
-async function pinMessage(groupId, message, requestUserId) {
-  const groupKey = String(groupId);
-  const result = await ddbDocClient.send(new GetCommand({
-    TableName: GROUPS_TABLE,
-    Key: { groupId: groupKey }
-  }));
-  const g = result.Item;
-  if (!g) throw new Error('Group not found');
-
-  // Kiểm tra quyền (OWNER/DEPUTY)
-  const memberRes = await ddbDocClient.send(new GetCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: String(requestUserId) }
-  }));
-  const member = memberRes.Item;
-  if (!member || (member.role !== 'OWNER' && member.role !== 'owner' && member.role !== 'DEPUTY' && member.role !== 'deputy')) {
-    throw new Error('Only OWNER or DEPUTY can pin messages');
-  }
-
-  let pinned = Array.isArray(g.pinnedMessages) ? g.pinnedMessages : [];
-  pinned = pinned.filter(m => String(m.id) !== String(message.id));
-
-  const pinObj = {
-    ...message,
-    pinnedBy: String(requestUserId),
-    pinnedAt: new Date().toISOString()
-  };
-  pinned.unshift(pinObj);
-
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: GROUPS_TABLE,
-    Key: { groupId: groupKey },
-    UpdateExpression: 'SET pinnedMessages = :p',
-    ExpressionAttributeValues: { ':p': pinned }
-  }));
-
-  return pinned;
-}
-
-async function unpinMessage(groupId, messageId, requestUserId) {
-  const groupKey = String(groupId);
-  const result = await ddbDocClient.send(new GetCommand({
-    TableName: GROUPS_TABLE,
-    Key: { groupId: groupKey }
-  }));
-  const g = result.Item;
-  if (!g) throw new Error('Group not found');
-
-  // Kiểm tra quyền
-  const memberRes = await ddbDocClient.send(new GetCommand({
-    TableName: MEMBERS_TABLE,
-    Key: { groupId: groupKey, userId: String(requestUserId) }
-  }));
-  const member = memberRes.Item;
-  if (!member || (member.role !== 'OWNER' && member.role !== 'owner' && member.role !== 'DEPUTY' && member.role !== 'deputy')) {
-    throw new Error('Only OWNER or DEPUTY can unpin messages');
-  }
-
-  let pinned = Array.isArray(g.pinnedMessages) ? g.pinnedMessages : [];
-
-  // Kiểm tra quyền: 
-  // 1. Nếu là OWNER/DEPUTY thì được gỡ mọi ghim
-  // 2. Nếu là MEMBER thì chỉ được gỡ ghim do chính mình tạo
-  const pinToUnpin = pinned.find(m => String(m.id) === String(messageId));
-  
-  const isPinner = pinToUnpin && String(pinToUnpin.pinnedBy) === String(requestUserId);
-  const isHighRole = member && (member.role === 'OWNER' || member.role === 'owner' || member.role === 'DEPUTY' || member.role === 'deputy');
-
-  if (pinToUnpin && pinToUnpin.pinnedBy && !isPinner && !isHighRole) {
-    throw new Error('Bạn không có quyền gỡ tin nhắn này');
-  }
-
-  pinned = pinned.filter(m => String(m.id) !== String(messageId));
-
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: GROUPS_TABLE,
-    Key: { groupId: groupKey },
-    UpdateExpression: 'SET pinnedMessages = :p',
-    ExpressionAttributeValues: { ':p': pinned }
-  }));
-
-  return pinned;
-}

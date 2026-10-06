@@ -178,22 +178,19 @@ async function recoverCallsOnBoot(io) {
   if (groupCallRepo) {
     let activeGroupCalls;
     try {
-      const { ddbDocClient } = require("../../config/awsConfig");
-      const { ScanCommand } = require("@aws-sdk/lib-dynamodb");
-      const { CALLS_TABLE } = require("./callModel");
-      const res = await ddbDocClient.send(
-        new ScanCommand({
-          TableName: CALLS_TABLE,
-          FilterExpression: "#s = :active AND (callType = :groupType OR callMode = :groupMode)",
-          ExpressionAttributeNames: { "#s": "status" },
-          ExpressionAttributeValues: {
-            ":active": "active",
-            ":groupType": "GROUP",
-            ":groupMode": "group",
-          },
-        }),
+      const { pool } = require("../../config/mysqlConfig");
+      const [rows] = await pool.query(
+        `SELECT * FROM call_sessions WHERE status = ? AND (call_type = ? OR call_mode = ?)`,
+        ["active", "GROUP", "group"],
       );
-      activeGroupCalls = res.Items || [];
+      activeGroupCalls = rows.map((row) => ({
+        callId: row.call_id,
+        callType: row.call_type,
+        callMode: row.call_mode,
+        conversationId: row.conversation_id,
+        status: row.status,
+        participants: Array.isArray(row.participants) ? row.participants : [],
+      }));
     } catch (err) {
       console.error("[call-recovery] Failed to scan group calls:", err.message);
       activeGroupCalls = [];

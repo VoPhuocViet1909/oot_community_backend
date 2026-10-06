@@ -1,8 +1,4 @@
-const { ddbDocClient } = require("../../config/awsConfig");
-const { GetCommand, PutCommand } = require("@aws-sdk/lib-dynamodb");
-
-const MESSAGES_TABLE = process.env.DDB_MESSAGES_TABLE || "ott_messages";
-const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
+const { pool } = require("../../config/mysqlConfig");
 
 /**
  * Looks up the sender's displayName and avatar_url from ott_users.
@@ -11,13 +7,11 @@ const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
  * @returns {Promise<{ senderDisplayName: string, senderAvatarUrl: string | null }>}
  */
 async function enrichSenderInfo(senderId) {
-  const result = await ddbDocClient.send(
-    new GetCommand({
-      TableName: USERS_TABLE,
-      Key: { userId: String(senderId) },
-    }),
+  const [rows] = await pool.query(
+    "SELECT display_name, username, avatar_url FROM users WHERE user_id = ? LIMIT 1",
+    [String(senderId)],
   );
-  const u = result.Item;
+  const u = rows[0];
   return {
     senderDisplayName: u?.display_name || u?.username || String(senderId),
     senderAvatarUrl: u?.avatar_url || null,
@@ -44,14 +38,12 @@ async function validateTargetConversations(
   for (const convId of uniqueTargets) {
     if (convId === sourceConversationId) continue; // self-forward is a no-op
 
-    const getRes = await ddbDocClient.send(
-      new GetCommand({
-        TableName: MESSAGES_TABLE,
-        Key: { conversationId: convId },
-      }),
+    const [rows] = await pool.query(
+      "SELECT conversation_id FROM messages WHERE conversation_id = ? LIMIT 1",
+      [convId],
     );
 
-    if (getRes.Item) {
+    if (rows[0]) {
       valid.push(convId);
     } else {
       missing.push(convId);
@@ -69,19 +61,17 @@ async function validateTargetConversations(
  * @returns {Promise<object|null>}  - The message object or null if not found
  */
 async function getMessageById(conversationId, messageId) {
-  const getRes = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MESSAGES_TABLE,
-      Key: { conversationId },
-    }),
+  const [rows] = await pool.query(
+    "SELECT messages FROM messages WHERE conversation_id = ? LIMIT 1",
+    [conversationId],
   );
 
-  if (!getRes.Item || !Array.isArray(getRes.Item.messages)) {
+  if (!rows[0] || !Array.isArray(rows[0].messages)) {
     return null;
   }
 
   return (
-    getRes.Item.messages.find((m) => String(m.id) === String(messageId)) || null
+    rows[0].messages.find((m) => String(m.id) === String(messageId)) || null
   );
 }
 
@@ -118,31 +108,22 @@ async function saveForwardedMessage(
     originalConversationId: originalMessage.conversationId || null,
   };
 
-  // Fetch existing conversation document
-  const getRes = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MESSAGES_TABLE,
-      Key: { conversationId: targetConversationId },
-    }),
+  // Fetch existing conversation row
+  const [rows] = await pool.query(
+    "SELECT messages FROM messages WHERE conversation_id = ? LIMIT 1",
+    [targetConversationId],
   );
 
-  const existing = getRes.Item || {
-    conversationId: targetConversationId,
-    messages: [],
-  };
-  const messages = Array.isArray(existing.messages)
-    ? existing.messages.slice()
+  const messages = rows[0] && Array.isArray(rows[0].messages)
+    ? rows[0].messages.slice()
     : [];
   messages.push(forwardedMessage);
 
-  await ddbDocClient.send(
-    new PutCommand({
-      TableName: MESSAGES_TABLE,
-      Item: {
-        conversationId: targetConversationId,
-        messages,
-      },
-    }),
+  await pool.query(
+    `INSERT INTO messages (conversation_id, messages, updated_at)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE messages = VALUES(messages), updated_at = VALUES(updated_at)`,
+    [targetConversationId, JSON.stringify(messages), createdAt],
   );
 
   return forwardedMessage;
@@ -209,17 +190,15 @@ async function forwardMessage({
   let resolvedSourceConversationId = String(sourceConversationId);
 
   for (const candidateId of sourceCandidates) {
-    let getSourceRes;
+    let rows;
     try {
-      getSourceRes = await ddbDocClient.send(
-        new GetCommand({
-          TableName: MESSAGES_TABLE,
-          Key: { conversationId: candidateId },
-        }),
+      [rows] = await pool.query(
+        "SELECT messages FROM messages WHERE conversation_id = ? LIMIT 1",
+        [candidateId],
       );
     } catch (dbError) {
       console.error(
-        "[messageForwardService] DynamoDB GetCommand failed:",
+        "[messageForwardService] MySQL SELECT failed:",
         dbError,
       );
       const err = new Error(
@@ -229,8 +208,8 @@ async function forwardMessage({
       throw err;
     }
 
-    if (getSourceRes.Item) {
-      sourceDoc = getSourceRes.Item;
+    if (rows[0]) {
+      sourceDoc = rows[0];
       resolvedSourceConversationId = candidateId;
       break;
     }

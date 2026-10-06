@@ -1,10 +1,42 @@
 const { randomUUID } = require('crypto');
-const { ddbDocClient } = require('../../config/awsConfig');
-const { PutCommand, GetCommand, QueryCommand, ScanCommand, UpdateCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
+const { pool } = require('../../config/mysqlConfig');
 const userService = require('../users/userService');
 
-const POSTS_TABLE = process.env.DDB_POSTS_TABLE || 'ott_posts';
-const COMMENTS_TABLE = process.env.DDB_COMMENTS_TABLE || 'ott_comments';
+/* ─── row <-> app object mapping ─────────────────────────────────────────── */
+
+function mapPostRow(row) {
+  if (!row) return null;
+  return {
+    postId: row.post_id,
+    userId: row.user_id,
+    authorName: row.author_name,
+    authorAvatar: row.author_avatar,
+    content: row.content,
+    media: Array.isArray(row.media) ? row.media : [],
+    likes: Array.isArray(row.likes) ? row.likes : [],
+    likeCount: row.like_count || 0,
+    commentCount: row.comment_count || 0,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapCommentRow(row) {
+  if (!row) return null;
+  return {
+    commentId: row.comment_id,
+    postId: row.post_id,
+    userId: row.user_id,
+    authorName: row.author_name,
+    authorAvatar: row.author_avatar,
+    content: row.content,
+    parentCommentId: row.parent_comment_id || null,
+    rootCommentId: row.root_comment_id || row.comment_id,
+    likes: Array.isArray(row.likes) ? row.likes : [],
+    likeCount: row.like_count || 0,
+    createdAt: row.created_at,
+  };
+}
 
 async function enrichLikes(likes) {
   const ids = Array.isArray(likes) ? likes : [];
@@ -13,11 +45,11 @@ async function enrichLikes(likes) {
       const user = await userService.getUserById(userId);
       return {
         userId: String(userId),
-        displayName: user?.display_name || user?.username || 'NgÆ°á»i dÃ¹ng',
+        displayName: user?.display_name || user?.username || 'Người dùng',
         avatarUrl: user?.avatar_url || null,
       };
     } catch {
-      return { userId: String(userId), displayName: 'NgÆ°á»i dÃ¹ng', avatarUrl: null };
+      return { userId: String(userId), displayName: 'Người dùng', avatarUrl: null };
     }
   }));
 }
@@ -59,21 +91,33 @@ async function createPost(userId, { content, media }) {
     updatedAt: now,
   };
 
-  await ddbDocClient.send(new PutCommand({
-    TableName: POSTS_TABLE,
-    Item: item,
-  }));
+  await pool.query(
+    `INSERT INTO posts
+      (post_id, user_id, author_name, author_avatar, content, media, likes, like_count, comment_count, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      item.postId,
+      item.userId,
+      item.authorName,
+      item.authorAvatar,
+      item.content,
+      JSON.stringify(item.media),
+      JSON.stringify(item.likes),
+      item.likeCount,
+      item.commentCount,
+      item.createdAt,
+      item.updatedAt,
+    ],
+  );
 
   return item;
 }
 
 async function getPostById(postId) {
   if (!postId) return null;
-  const result = await ddbDocClient.send(new GetCommand({
-    TableName: POSTS_TABLE,
-    Key: { postId: String(postId) },
-  }));
-  return result.Item ? enrichPost(result.Item) : null;
+  const [rows] = await pool.query('SELECT * FROM posts WHERE post_id = ? LIMIT 1', [String(postId)]);
+  const post = mapPostRow(rows[0]);
+  return post ? enrichPost(post) : null;
 }
 
 async function getFeedPosts(userId, { limit = 20, lastKey } = {}) {
@@ -90,21 +134,13 @@ async function getFeedPosts(userId, { limit = 20, lastKey } = {}) {
   // Include the user's own posts
   const allowedUserIds = [String(userId), ...friendIds];
 
-  // Scan all posts and filter by allowed users
-  // (In production, you'd use a GSI on userId + createdAt)
-  const scanParams = {
-    TableName: POSTS_TABLE,
-    Limit: 200, // scan a larger set, then filter & sort
-  };
+  // Friend-id list is known upfront, so query directly for those authors
+  const [rows] = await pool.query(
+    'SELECT * FROM posts WHERE user_id IN (?) ORDER BY created_at DESC LIMIT ?',
+    [allowedUserIds, limit],
+  );
 
-  const result = await ddbDocClient.send(new ScanCommand(scanParams));
-  const allPosts = result.Items || [];
-
-  // Filter posts from friends + self
-  const feedPosts = allPosts
-    .filter(p => allowedUserIds.includes(String(p.userId)))
-    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-    .slice(0, limit);
+  const feedPosts = rows.map(mapPostRow);
 
   return {
     posts: await Promise.all(feedPosts.map(enrichPost)),
@@ -113,16 +149,12 @@ async function getFeedPosts(userId, { limit = 20, lastKey } = {}) {
 }
 
 async function getUserPosts(userId, { limit = 20 } = {}) {
-  const result = await ddbDocClient.send(new ScanCommand({
-    TableName: POSTS_TABLE,
-    FilterExpression: '#uid = :uid',
-    ExpressionAttributeNames: { '#uid': 'userId' },
-    ExpressionAttributeValues: { ':uid': String(userId) },
-  }));
+  const [rows] = await pool.query(
+    'SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC LIMIT ?',
+    [String(userId), limit],
+  );
 
-  const posts = (result.Items || [])
-    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-    .slice(0, limit);
+  const posts = rows.map(mapPostRow);
 
   return { posts: await Promise.all(posts.map(enrichPost)), count: posts.length };
 }
@@ -143,19 +175,10 @@ async function updatePost(postId, userId, { content } = {}) {
   }
 
   const updatedAt = new Date().toISOString();
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: POSTS_TABLE,
-    Key: { postId: String(postId) },
-    UpdateExpression: 'SET #content = :content, #updatedAt = :updatedAt',
-    ExpressionAttributeNames: {
-      '#content': 'content',
-      '#updatedAt': 'updatedAt',
-    },
-    ExpressionAttributeValues: {
-      ':content': nextContent,
-      ':updatedAt': updatedAt,
-    },
-  }));
+  await pool.query(
+    'UPDATE posts SET content = ?, updated_at = ? WHERE post_id = ?',
+    [nextContent, updatedAt, String(postId)],
+  );
 
   return getPostById(postId);
 }
@@ -175,21 +198,10 @@ async function toggleLike(postId, userId) {
     newLikes = [...likes, userIdStr];
   }
 
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: POSTS_TABLE,
-    Key: { postId: String(postId) },
-    UpdateExpression: 'SET #likes = :likes, #likeCount = :likeCount, #updatedAt = :updatedAt',
-    ExpressionAttributeNames: {
-      '#likes': 'likes',
-      '#likeCount': 'likeCount',
-      '#updatedAt': 'updatedAt',
-    },
-    ExpressionAttributeValues: {
-      ':likes': newLikes,
-      ':likeCount': newLikes.length,
-      ':updatedAt': new Date().toISOString(),
-    },
-  }));
+  await pool.query(
+    'UPDATE posts SET likes = ?, like_count = ?, updated_at = ? WHERE post_id = ?',
+    [JSON.stringify(newLikes), newLikes.length, new Date().toISOString(), String(postId)],
+  );
 
   return {
     liked: !alreadyLiked,
@@ -206,10 +218,7 @@ async function deletePost(postId, userId) {
     throw new Error('Bạn không có quyền xóa bài viết này');
   }
 
-  await ddbDocClient.send(new DeleteCommand({
-    TableName: POSTS_TABLE,
-    Key: { postId: String(postId) },
-  }));
+  await pool.query('DELETE FROM posts WHERE post_id = ?', [String(postId)]);
 
   return { deleted: true };
 }
@@ -231,13 +240,13 @@ async function createComment(postId, userId, { content, parentCommentId }) {
   let parentComment = null;
 
   if (parentCommentId) {
-    const parentResult = await ddbDocClient.send(new GetCommand({
-      TableName: COMMENTS_TABLE,
-      Key: { commentId: String(parentCommentId) },
-    }));
-    parentComment = parentResult.Item;
+    const [parentRows] = await pool.query(
+      'SELECT * FROM comments WHERE comment_id = ? LIMIT 1',
+      [String(parentCommentId)],
+    );
+    parentComment = mapCommentRow(parentRows[0]);
     if (!parentComment || String(parentComment.postId) !== String(postId)) {
-      throw new Error('BÃ¬nh luáº­n gá»‘c khÃ´ng tá»“n táº¡i');
+      throw new Error('Bình luận gốc không tồn tại');
     }
   }
 
@@ -255,39 +264,39 @@ async function createComment(postId, userId, { content, parentCommentId }) {
     createdAt: now,
   };
 
-  await ddbDocClient.send(new PutCommand({
-    TableName: COMMENTS_TABLE,
-    Item: comment,
-  }));
+  await pool.query(
+    `INSERT INTO comments
+      (comment_id, post_id, user_id, author_name, author_avatar, content, parent_comment_id, root_comment_id, likes, like_count, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      comment.commentId,
+      comment.postId,
+      comment.userId,
+      comment.authorName,
+      comment.authorAvatar,
+      comment.content,
+      comment.parentCommentId,
+      comment.rootCommentId,
+      JSON.stringify(comment.likes),
+      comment.likeCount,
+      comment.createdAt,
+    ],
+  );
 
   // Update post comment count
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: POSTS_TABLE,
-    Key: { postId: String(postId) },
-    UpdateExpression: 'SET #commentCount = if_not_exists(#commentCount, :zero) + :one, #updatedAt = :updatedAt',
-    ExpressionAttributeNames: {
-      '#commentCount': 'commentCount',
-      '#updatedAt': 'updatedAt',
-    },
-    ExpressionAttributeValues: {
-      ':zero': 0,
-      ':one': 1,
-      ':updatedAt': now,
-    },
-  }));
+  await pool.query(
+    'UPDATE posts SET comment_count = comment_count + 1, updated_at = ? WHERE post_id = ?',
+    [now, String(postId)],
+  );
 
   return comment;
 }
 
 async function getComments(postId, { limit = 50 } = {}) {
-  const result = await ddbDocClient.send(new ScanCommand({
-    TableName: COMMENTS_TABLE,
-    FilterExpression: '#pid = :pid',
-    ExpressionAttributeNames: { '#pid': 'postId' },
-    ExpressionAttributeValues: { ':pid': String(postId) },
-  }));
+  const [rows] = await pool.query('SELECT * FROM comments WHERE post_id = ?', [String(postId)]);
 
-  const comments = (result.Items || [])
+  const comments = rows
+    .map(mapCommentRow)
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
     .slice(0, limit);
 
@@ -304,25 +313,19 @@ async function getComments(postId, { limit = 50 } = {}) {
 }
 
 async function toggleCommentLike(commentId, userId) {
-  const result = await ddbDocClient.send(new GetCommand({
-    TableName: COMMENTS_TABLE,
-    Key: { commentId: String(commentId) },
-  }));
-  const comment = result.Item;
-  if (!comment) throw new Error('BÃ¬nh luáº­n khÃ´ng tá»“n táº¡i');
+  const [rows] = await pool.query('SELECT * FROM comments WHERE comment_id = ? LIMIT 1', [String(commentId)]);
+  const comment = mapCommentRow(rows[0]);
+  if (!comment) throw new Error('Bình luận không tồn tại');
 
   const likes = Array.isArray(comment.likes) ? comment.likes : [];
   const userIdStr = String(userId);
   const alreadyLiked = likes.includes(userIdStr);
   const newLikes = alreadyLiked ? likes.filter(id => id !== userIdStr) : [...likes, userIdStr];
 
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: COMMENTS_TABLE,
-    Key: { commentId: String(commentId) },
-    UpdateExpression: 'SET #likes = :likes, #likeCount = :likeCount',
-    ExpressionAttributeNames: { '#likes': 'likes', '#likeCount': 'likeCount' },
-    ExpressionAttributeValues: { ':likes': newLikes, ':likeCount': newLikes.length },
-  }));
+  await pool.query(
+    'UPDATE comments SET likes = ?, like_count = ? WHERE comment_id = ?',
+    [JSON.stringify(newLikes), newLikes.length, String(commentId)],
+  );
 
   return {
     liked: !alreadyLiked,
@@ -335,11 +338,8 @@ async function toggleCommentLike(commentId, userId) {
 async function updateComment(commentId, userId, content) {
   if (!content || !String(content).trim()) throw new Error('Bình luận không được để trống');
 
-  const result = await ddbDocClient.send(new GetCommand({
-    TableName: COMMENTS_TABLE,
-    Key: { commentId: String(commentId) },
-  }));
-  const comment = result.Item;
+  const [rows] = await pool.query('SELECT * FROM comments WHERE comment_id = ? LIMIT 1', [String(commentId)]);
+  const comment = mapCommentRow(rows[0]);
   if (!comment) throw new Error('Bình luận không tồn tại');
   if (String(comment.userId) !== String(userId)) {
     throw new Error('Bạn không có quyền chỉnh sửa bình luận này');
@@ -347,36 +347,24 @@ async function updateComment(commentId, userId, content) {
 
   const updatedAt = new Date().toISOString();
   const nextContent = String(content).trim();
-  await ddbDocClient.send(new UpdateCommand({
-    TableName: COMMENTS_TABLE,
-    Key: { commentId: String(commentId) },
-    UpdateExpression: 'SET #content = :content, #updatedAt = :updatedAt',
-    ExpressionAttributeNames: { '#content': 'content', '#updatedAt': 'updatedAt' },
-    ExpressionAttributeValues: { ':content': nextContent, ':updatedAt': updatedAt },
-  }));
+  await pool.query(
+    'UPDATE comments SET content = ? WHERE comment_id = ?',
+    [nextContent, String(commentId)],
+  );
 
   return { ...comment, content: nextContent, updatedAt };
 }
 
 async function deleteComment(commentId, userId) {
-  const result = await ddbDocClient.send(new GetCommand({
-    TableName: COMMENTS_TABLE,
-    Key: { commentId: String(commentId) },
-  }));
-
-  const comment = result.Item;
+  const [rows] = await pool.query('SELECT * FROM comments WHERE comment_id = ? LIMIT 1', [String(commentId)]);
+  const comment = mapCommentRow(rows[0]);
   if (!comment) throw new Error('Bình luận không tồn tại');
   if (String(comment.userId) !== String(userId)) {
     throw new Error('Bạn không có quyền xóa bình luận này');
   }
 
-  const branchResult = await ddbDocClient.send(new ScanCommand({
-    TableName: COMMENTS_TABLE,
-    FilterExpression: '#pid = :pid',
-    ExpressionAttributeNames: { '#pid': 'postId' },
-    ExpressionAttributeValues: { ':pid': String(comment.postId) },
-  }));
-  const allComments = branchResult.Items || [];
+  const [branchRows] = await pool.query('SELECT * FROM comments WHERE post_id = ?', [String(comment.postId)]);
+  const allComments = branchRows.map(mapCommentRow);
   const deletedIds = new Set([String(commentId)]);
   let foundChild = true;
   while (foundChild) {
@@ -389,20 +377,14 @@ async function deleteComment(commentId, userId) {
     }
   }
 
-  await Promise.all([...deletedIds].map(id => ddbDocClient.send(new DeleteCommand({
-    TableName: COMMENTS_TABLE,
-    Key: { commentId: id },
-  }))));
+  await Promise.all([...deletedIds].map(id => pool.query('DELETE FROM comments WHERE comment_id = ?', [id])));
 
   // Decrease comment count on post
   try {
-    await ddbDocClient.send(new UpdateCommand({
-      TableName: POSTS_TABLE,
-      Key: { postId: String(comment.postId) },
-      UpdateExpression: 'SET #commentCount = if_not_exists(#commentCount, :deletedCount) - :deletedCount',
-      ExpressionAttributeNames: { '#commentCount': 'commentCount' },
-      ExpressionAttributeValues: { ':deletedCount': deletedIds.size },
-    }));
+    await pool.query(
+      'UPDATE posts SET comment_count = comment_count - ? WHERE post_id = ?',
+      [deletedIds.size, String(comment.postId)],
+    );
   } catch (e) {
     console.warn('Failed to decrease comment count:', e.message);
   }

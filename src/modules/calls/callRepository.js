@@ -1,41 +1,139 @@
 /**
- * Data access layer for ott_call_sessions.
+ * Data access layer for call_sessions (1:1 direct calls).
  *
- * All DynamoDB operations for call sessions live here.
- * Business logic (callService) depends on this — never on DynamoDB directly.
+ * All MySQL operations for call sessions live here.
+ * Business logic (callService) depends on this — never on MySQL directly.
  *
  * @see callModel.js for the schema definition
  */
 
-const {
-  PutCommand,
-  GetCommand,
-  UpdateCommand,
-  QueryCommand,
-  ScanCommand,
-} = require("@aws-sdk/lib-dynamodb");
-const { ddbDocClient } = require("../../config/awsConfig");
-const { CALLS_TABLE } = require("./callModel");
+const { pool } = require("../../config/mysqlConfig");
 const { CALL_STATUS, BLOCKING_STATUSES, PARTICIPANT_STATUS, CONNECTION_STATE, ENDED_REASON } = require("./call.constants");
+
+// ─── Row <-> Session mapping ────────────────────────────────────────────────
+
+/**
+ * Map a call_sessions row (snake_case columns) back to the camelCase shape
+ * produced by callModel.createCallSession() / previously stored in DynamoDB.
+ *
+ * @param {Object} row
+ * @returns {Object|null}
+ */
+function mapRowToSession(row) {
+  if (!row) return null;
+  return {
+    callId: row.call_id,
+    conversationId: row.conversation_id,
+    initiatorId: row.initiator_id,
+    callMode: row.call_mode,
+    callType: row.call_type,
+    provider: row.provider,
+    channelName: row.channel_name,
+    participants: Array.isArray(row.participants) ? row.participants : [],
+    status: row.status,
+    endedReason: row.ended_reason,
+    endedBy: row.ended_by,
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+    durationSeconds: row.duration_seconds,
+    callLogCreated: !!row.call_log_created,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+// Map of camelCase callSession fields to call_sessions columns, used by the
+// generic updateStatus() to build dynamic SET clauses safely (no raw key injection).
+const FIELD_TO_COLUMN = {
+  conversationId: "conversation_id",
+  callType: "call_type",
+  callMode: "call_mode",
+  initiatorId: "initiator_id",
+  callerId: "caller_id",
+  provider: "provider",
+  channelName: "channel_name",
+  participants: "participants",
+  status: "status",
+  endedReason: "ended_reason",
+  endedBy: "ended_by",
+  startedAt: "started_at",
+  endedAt: "ended_at",
+  durationSeconds: "duration_seconds",
+  callLogCreated: "call_log_created",
+  activeCallMessageCreated: "active_call_message_created",
+  createdAt: "created_at",
+  updatedAt: "updated_at",
+};
 
 // ─── Create ─────────────────────────────────────────────────────────────────
 
 /**
- * Store a new call session in DynamoDB.
- * Uses a conditional put to prevent duplicate callId.
+ * Store a new call session in MySQL.
+ * Uses the call_id PRIMARY KEY as a uniqueness guard (equivalent to the
+ * previous DynamoDB conditional put on attribute_not_exists(callId)).
  *
  * @param {Object} callSession - The call session item from createCallSession()
  * @returns {Object} The stored item
- * @throws {Error} If callId already exists (ConditionalCheckFailedException)
+ * @throws {Error} If callId already exists (mirrors the old ConditionalCheckFailedException)
  */
 async function create(callSession) {
-  await ddbDocClient.send(
-    new PutCommand({
-      TableName: CALLS_TABLE,
-      Item: callSession,
-      ConditionExpression: "attribute_not_exists(callId)",
-    }),
-  );
+  const {
+    callId,
+    conversationId,
+    initiatorId,
+    callMode,
+    callType,
+    provider,
+    channelName,
+    participants,
+    status,
+    endedReason,
+    endedBy,
+    startedAt,
+    endedAt,
+    durationSeconds,
+    callLogCreated,
+    createdAt,
+    updatedAt,
+  } = callSession;
+
+  try {
+    await pool.query(
+      `INSERT INTO call_sessions
+        (call_id, conversation_id, call_type, call_mode, initiator_id, caller_id, provider,
+         channel_name, participants, status, ended_reason, ended_by, started_at, ended_at,
+         duration_seconds, call_log_created, active_call_message_created, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        callId,
+        conversationId || null,
+        callType || null,
+        callMode || null,
+        initiatorId || null,
+        initiatorId || null, // caller_id: direct calls track only initiatorId; mirror it here
+        provider || null,
+        channelName || null,
+        JSON.stringify(participants || []),
+        status || null,
+        endedReason || null,
+        endedBy || null,
+        startedAt || null,
+        endedAt || null,
+        durationSeconds || 0,
+        callLogCreated ? 1 : 0,
+        0,
+        createdAt || null,
+        updatedAt || null,
+      ],
+    );
+  } catch (err) {
+    if (err && err.code === "ER_DUP_ENTRY") {
+      const dupErr = new Error(`Call ${callId} already exists`);
+      dupErr.code = "CALL_ALREADY_EXISTS";
+      throw dupErr;
+    }
+    throw err;
+  }
   return callSession;
 }
 
@@ -48,68 +146,48 @@ async function create(callSession) {
  * @returns {Object|null} The call session or null if not found
  */
 async function getById(callId) {
-  const res = await ddbDocClient.send(
-    new GetCommand({
-      TableName: CALLS_TABLE,
-      Key: { callId },
-    }),
+  const [rows] = await pool.query(
+    "SELECT * FROM call_sessions WHERE call_id = ? LIMIT 1",
+    [callId],
   );
-  return res.Item || null;
+  return rows.length ? mapRowToSession(rows[0]) : null;
 }
 
 /**
  * Find an active or ringing call in a given conversation.
- * Uses the conversationId-index GSI.
  *
  * @param {string} conversationId
  * @returns {Object|null} The active/ringing call session or null
  */
 async function findActiveByConversation(conversationId) {
-  const res = await ddbDocClient.send(
-    new QueryCommand({
-      TableName: CALLS_TABLE,
-      IndexName: "conversationId-index",
-      KeyConditionExpression: "conversationId = :cid",
-      FilterExpression: "#s IN (:ringing, :active, :reconnecting)",
-      ExpressionAttributeNames: { "#s": "status" },
-      ExpressionAttributeValues: {
-        ":cid": String(conversationId),
-        ":ringing": CALL_STATUS.RINGING,
-        ":active": CALL_STATUS.ACTIVE,
-        ":reconnecting": CALL_STATUS.RECONNECTING,
-      },
-    }),
+  const [rows] = await pool.query(
+    `SELECT * FROM call_sessions
+     WHERE conversation_id = ? AND status IN (?, ?, ?)
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [String(conversationId), CALL_STATUS.RINGING, CALL_STATUS.ACTIVE, CALL_STATUS.RECONNECTING],
   );
-  const items = res.Items || [];
-  return items.length > 0 ? items[0] : null;
+  return rows.length ? mapRowToSession(rows[0]) : null;
 }
 
 /**
  * Check if a user is currently busy in any active or ringing call.
- * Scans the table with a filter on status and participant presence.
  *
  * @param {string} userId
  * @returns {Promise<{busy: boolean, callId?: string}>}
  */
 async function isUserBusy(userId) {
-  const res = await ddbDocClient.send(
-    new ScanCommand({
-      TableName: CALLS_TABLE,
-      FilterExpression:
-        "#s IN (:active, :ringing, :reconnecting)",
-      ExpressionAttributeNames: { "#s": "status" },
-      ExpressionAttributeValues: {
-        ":active": CALL_STATUS.ACTIVE,
-        ":ringing": CALL_STATUS.RINGING,
-        ":reconnecting": CALL_STATUS.RECONNECTING,
-      },
-    }),
+  const [rows] = await pool.query(
+    `SELECT * FROM call_sessions WHERE status IN (?, ?, ?)`,
+    [CALL_STATUS.ACTIVE, CALL_STATUS.RINGING, CALL_STATUS.RECONNECTING],
   );
   const uid = String(userId);
-  const items = (res.Items || []).filter((item) =>
-    Array.isArray(item.participants) &&
-    item.participants.some((p) => String(p.userId) === uid),
-  );
+  const items = rows
+    .map(mapRowToSession)
+    .filter((item) =>
+      Array.isArray(item.participants) &&
+      item.participants.some((p) => String(p.userId) === uid),
+    );
   items.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
   if (items.length > 0) {
     return { busy: true, callId: items[0].callId };
@@ -119,35 +197,44 @@ async function isUserBusy(userId) {
 
 /**
  * Get call history for a conversation (all statuses), sorted by createdAt descending.
- * Uses the conversationId-index GSI.
+ * Uses keyset pagination over (created_at, call_id) in place of the old
+ * DynamoDB LastEvaluatedKey/ExclusiveStartKey.
  *
  * @param {string} conversationId
  * @param {Object} [options]
  * @param {number} [options.limit=20] - Max items to return
- * @param {Object} [options.exclusiveStartKey] - DynamoDB pagination key
+ * @param {Object} [options.exclusiveStartKey] - { createdAt, callId } cursor, decoded by the caller
  * @returns {Promise<{items: Array, lastEvaluatedKey?: Object}>}
  */
 async function getHistoryByConversation(
   conversationId,
   { limit = 20, exclusiveStartKey } = {},
 ) {
-  const params = {
-    TableName: CALLS_TABLE,
-    IndexName: "conversationId-index",
-    KeyConditionExpression: "conversationId = :cid",
-    ExpressionAttributeValues: { ":cid": String(conversationId) },
-    ScanIndexForward: false, // newest first
-    Limit: limit,
-  };
-  if (exclusiveStartKey) {
-    params.ExclusiveStartKey = exclusiveStartKey;
+  const params = [String(conversationId)];
+  let sql = `SELECT * FROM call_sessions WHERE conversation_id = ?`;
+
+  if (exclusiveStartKey && exclusiveStartKey.createdAt && exclusiveStartKey.callId) {
+    sql += ` AND (created_at, call_id) < (?, ?)`;
+    params.push(exclusiveStartKey.createdAt, exclusiveStartKey.callId);
   }
 
-  const res = await ddbDocClient.send(new QueryCommand(params));
-  return {
-    items: res.Items || [],
-    lastEvaluatedKey: res.LastEvaluatedKey || null,
-  };
+  sql += ` ORDER BY created_at DESC, call_id DESC LIMIT ?`;
+  // Fetch one extra row to detect whether there are more pages, mirroring
+  // DynamoDB's LastEvaluatedKey semantics (only present when more data exists).
+  params.push(limit + 1);
+
+  const [rows] = await pool.query(sql, params);
+  const hasMore = rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  const items = pageRows.map(mapRowToSession);
+  const lastEvaluatedKey = hasMore
+    ? {
+        createdAt: pageRows[pageRows.length - 1].created_at,
+        callId: pageRows[pageRows.length - 1].call_id,
+      }
+    : null;
+
+  return { items, lastEvaluatedKey };
 }
 
 // ─── Update ─────────────────────────────────────────────────────────────────
@@ -163,29 +250,23 @@ async function getHistoryByConversation(
 async function updateStatus(callId, newStatus, extraFields = {}) {
   const now = new Date().toISOString();
 
-  // Build dynamic SET expressions
-  const setParts = ["#s = :status", "updatedAt = :now"];
-  const exprNames = { "#s": "status" };
-  const exprValues = { ":status": newStatus, ":now": now };
+  const setClauses = ["status = ?", "updated_at = ?"];
+  const values = [newStatus, now];
 
   for (const [key, value] of Object.entries(extraFields)) {
-    const safeKey = key.replace(/[^a-zA-Z0-9_]/g, "");
-    setParts.push(`#${safeKey} = :${safeKey}`);
-    exprNames[`#${safeKey}`] = key;
-    exprValues[`:${safeKey}`] = value;
+    const column = FIELD_TO_COLUMN[key];
+    if (!column) continue; // ignore unknown fields, same as before (no injection risk)
+    setClauses.push(`${column} = ?`);
+    values.push(key === "participants" ? JSON.stringify(value) : value);
   }
 
-  const res = await ddbDocClient.send(
-    new UpdateCommand({
-      TableName: CALLS_TABLE,
-      Key: { callId },
-      UpdateExpression: `SET ${setParts.join(", ")}`,
-      ExpressionAttributeNames: exprNames,
-      ExpressionAttributeValues: exprValues,
-      ReturnValues: "ALL_NEW",
-    }),
+  values.push(callId);
+
+  await pool.query(
+    `UPDATE call_sessions SET ${setClauses.join(", ")} WHERE call_id = ?`,
+    values,
   );
-  return res.Attributes;
+  return getById(callId);
 }
 
 /**
@@ -197,20 +278,11 @@ async function updateStatus(callId, newStatus, extraFields = {}) {
  */
 async function activateCall(callId) {
   const now = new Date().toISOString();
-  const res = await ddbDocClient.send(
-    new UpdateCommand({
-      TableName: CALLS_TABLE,
-      Key: { callId },
-      UpdateExpression: "SET #s = :active, startedAt = :now, updatedAt = :now",
-      ExpressionAttributeNames: { "#s": "status" },
-      ExpressionAttributeValues: {
-        ":active": CALL_STATUS.ACTIVE,
-        ":now": now,
-      },
-      ReturnValues: "ALL_NEW",
-    }),
+  await pool.query(
+    `UPDATE call_sessions SET status = ?, started_at = ?, updated_at = ? WHERE call_id = ?`,
+    [CALL_STATUS.ACTIVE, now, now, callId],
   );
-  return res.Attributes;
+  return getById(callId);
 }
 
 /**
@@ -228,34 +300,24 @@ async function endCall(callId, endedBy, endedReason, startedAt) {
     ? Math.floor((new Date(now).getTime() - new Date(startedAt).getTime()) / 1000)
     : 0;
 
-  const res = await ddbDocClient.send(
-    new UpdateCommand({
-      TableName: CALLS_TABLE,
-      Key: { callId },
-      UpdateExpression:
-        "SET #s = :ended, endedAt = :now, endedBy = :by, endedReason = :reason, durationSeconds = :dur, updatedAt = :now",
-      ExpressionAttributeNames: { "#s": "status" },
-      ExpressionAttributeValues: {
-        ":ended": CALL_STATUS.ENDED,
-        ":now": now,
-        ":by": String(endedBy),
-        ":reason": endedReason,
-        ":dur": Math.max(0, durationSeconds),
-      },
-      ReturnValues: "ALL_NEW",
-    }),
+  await pool.query(
+    `UPDATE call_sessions
+     SET status = ?, ended_at = ?, ended_by = ?, ended_reason = ?, duration_seconds = ?, updated_at = ?
+     WHERE call_id = ?`,
+    [CALL_STATUS.ENDED, now, String(endedBy), endedReason, Math.max(0, durationSeconds), now, callId],
   );
-  return res.Attributes;
+  return getById(callId);
 }
 
 // ─── Participant Updates ────────────────────────────────────────────────────
 
 /**
  * Update a specific participant's fields within the participants list.
- * Uses list_append + filter to update in-place.
  *
- * Since DynamoDB doesn't support updating nested list items by index directly,
- * we read the full item, mutate in memory, and write back (read-modify-write).
+ * MySQL JSON columns don't support updating an array element by index
+ * directly from SQL in a single statement that's also easy to reason about,
+ * so (like before) we read the full row, mutate in memory, and write back
+ * (read-modify-write).
  *
  * @param {string} callId
  * @param {string} userId - The participant's userId
@@ -264,7 +326,6 @@ async function endCall(callId, endedBy, endedReason, startedAt) {
  * @throws {Error} If participant not found
  */
 async function updateParticipant(callId, userId, updates) {
-  // Read-modify-write for nested list update
   const call = await getById(callId);
   if (!call) throw new Error(`Call ${callId} not found`);
 
@@ -277,19 +338,15 @@ async function updateParticipant(callId, userId, updates) {
     );
   }
 
-  // Merge updates into the participant
   call.participants[idx] = {
     ...call.participants[idx],
     ...updates,
   };
   call.updatedAt = new Date().toISOString();
 
-  // Write back the full item
-  await ddbDocClient.send(
-    new PutCommand({
-      TableName: CALLS_TABLE,
-      Item: call,
-    }),
+  await pool.query(
+    `UPDATE call_sessions SET participants = ?, updated_at = ? WHERE call_id = ?`,
+    [JSON.stringify(call.participants), call.updatedAt, callId],
   );
   return call;
 }
@@ -306,7 +363,6 @@ async function addParticipant(callId, participant) {
   const call = await getById(callId);
   if (!call) throw new Error(`Call ${callId} not found`);
 
-  // Check if participant already exists
   const exists = call.participants.some(
     (p) => p.userId === String(participant.userId),
   );
@@ -328,11 +384,9 @@ async function addParticipant(callId, participant) {
   });
   call.updatedAt = new Date().toISOString();
 
-  await ddbDocClient.send(
-    new PutCommand({
-      TableName: CALLS_TABLE,
-      Item: call,
-    }),
+  await pool.query(
+    `UPDATE call_sessions SET participants = ?, updated_at = ? WHERE call_id = ?`,
+    [JSON.stringify(call.participants), call.updatedAt, callId],
   );
   return call;
 }
@@ -383,63 +437,41 @@ async function markParticipantLeft(callId, userId) {
 
 /**
  * Atomically set callLogCreated = true, but only if it is currently false.
- * Uses a conditional update to prevent concurrent double-writes.
+ * Uses `UPDATE ... WHERE call_log_created = 0` as the atomic "only one writer
+ * wins" lock, equivalent to the old DynamoDB ConditionExpression.
  *
  * @param {string} callId
  * @returns {Promise<boolean>} true if the flag was set (caller should create the log),
  *                              false if it was already true (caller should skip)
  */
 async function markCallLogCreated(callId) {
-  try {
-    await ddbDocClient.send(
-      new UpdateCommand({
-        TableName: CALLS_TABLE,
-        Key: { callId },
-        UpdateExpression: "SET callLogCreated = :true",
-        ConditionExpression: "callLogCreated = :false",
-        ExpressionAttributeValues: {
-          ":true": true,
-          ":false": false,
-        },
-      }),
-    );
-    return true; // We won the race — caller should create the log
-  } catch (err) {
-    if (err.name === "ConditionalCheckFailedException") {
-      return false; // Already marked — caller should skip
-    }
-    throw err;
-  }
+  const [result] = await pool.query(
+    `UPDATE call_sessions SET call_log_created = 1 WHERE call_id = ? AND call_log_created = 0`,
+    [callId],
+  );
+  return result.affectedRows === 1; // 1 row affected => we won the race
 }
 
 // ─── Active Call Lookup ─────────────────────────────────────────────────────
 
 /**
  * Find the active or ringing call that a user is currently participating in.
- * Scans the table with a filter on status and participant presence.
  *
  * @param {string} userId
  * @returns {Promise<Object|null>} The call session or null
  */
 async function findActiveForUser(userId) {
-  const res = await ddbDocClient.send(
-    new ScanCommand({
-      TableName: CALLS_TABLE,
-      FilterExpression:
-        "#s IN (:active, :ringing, :reconnecting)",
-      ExpressionAttributeNames: { "#s": "status" },
-      ExpressionAttributeValues: {
-        ":active": CALL_STATUS.ACTIVE,
-        ":ringing": CALL_STATUS.RINGING,
-        ":reconnecting": CALL_STATUS.RECONNECTING,
-      },
-    }),
+  const [rows] = await pool.query(
+    `SELECT * FROM call_sessions WHERE status IN (?, ?, ?)`,
+    [CALL_STATUS.ACTIVE, CALL_STATUS.RINGING, CALL_STATUS.RECONNECTING],
   );
   const uid = String(userId);
-  const items = (res.Items || []).filter((item) =>
-    Array.isArray(item.participants) &&
-    item.participants.some((p) => String(p.userId) === uid),
-  );
+  const items = rows
+    .map(mapRowToSession)
+    .filter((item) =>
+      Array.isArray(item.participants) &&
+      item.participants.some((p) => String(p.userId) === uid),
+    );
   items.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
   return items.length > 0 ? items[0] : null;
 }
@@ -451,15 +483,11 @@ async function findActiveForUser(userId) {
  * @returns {Promise<Object[]>} Array of ringing call sessions
  */
 async function findAllRinging() {
-  const res = await ddbDocClient.send(
-    new ScanCommand({
-      TableName: CALLS_TABLE,
-      FilterExpression: "#s = :ringing",
-      ExpressionAttributeNames: { "#s": "status" },
-      ExpressionAttributeValues: { ":ringing": CALL_STATUS.RINGING },
-    }),
+  const [rows] = await pool.query(
+    `SELECT * FROM call_sessions WHERE status = ?`,
+    [CALL_STATUS.RINGING],
   );
-  return res.Items || [];
+  return rows.map(mapRowToSession);
 }
 
 /**
@@ -467,15 +495,11 @@ async function findAllRinging() {
  * @returns {Promise<Object[]>} Array of active call sessions
  */
 async function findAllActive() {
-  const res = await ddbDocClient.send(
-    new ScanCommand({
-      TableName: CALLS_TABLE,
-      FilterExpression: "#s = :active",
-      ExpressionAttributeNames: { "#s": "status" },
-      ExpressionAttributeValues: { ":active": CALL_STATUS.ACTIVE },
-    }),
+  const [rows] = await pool.query(
+    `SELECT * FROM call_sessions WHERE status = ?`,
+    [CALL_STATUS.ACTIVE],
   );
-  return res.Items || [];
+  return rows.map(mapRowToSession);
 }
 
 /**
@@ -487,23 +511,11 @@ async function findAllActive() {
  * @returns {Promise<number>} Number of calls cleaned up
  */
 async function cleanupStaleConversationCalls(conversationId, reason = ENDED_REASON.SYSTEM_CLEANUP) {
-  // Find ALL calls for this conversation (any status)
-  const res = await ddbDocClient.send(
-    new QueryCommand({
-      TableName: CALLS_TABLE,
-      IndexName: "conversationId-index",
-      KeyConditionExpression: "conversationId = :cid",
-      FilterExpression: "#s IN (:ringing, :active, :reconnecting)",
-      ExpressionAttributeNames: { "#s": "status" },
-      ExpressionAttributeValues: {
-        ":cid": String(conversationId),
-        ":ringing": CALL_STATUS.RINGING,
-        ":active": CALL_STATUS.ACTIVE,
-        ":reconnecting": CALL_STATUS.RECONNECTING,
-      },
-    }),
+  const [rows] = await pool.query(
+    `SELECT * FROM call_sessions WHERE conversation_id = ? AND status IN (?, ?, ?)`,
+    [String(conversationId), CALL_STATUS.RINGING, CALL_STATUS.ACTIVE, CALL_STATUS.RECONNECTING],
   );
-  const items = res.Items || [];
+  const items = rows.map(mapRowToSession);
   let cleaned = 0;
   for (const item of items) {
     try {

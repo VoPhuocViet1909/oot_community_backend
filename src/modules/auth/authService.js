@@ -1,8 +1,5 @@
-const { ddbDocClient } = require('../../config/awsConfig');
-const { PutCommand, ScanCommand } = require('@aws-sdk/lib-dynamodb');
+const { pool } = require('../../config/mysqlConfig');
 const bcrypt = require('bcryptjs');
-
-const USERS_TABLE = process.env.DDB_USERS_TABLE || 'ott_users';
 
 function normalizeUsername(input) {
   return String(input || '').trim().normalize('NFKC');
@@ -31,107 +28,51 @@ function isValidPhoneNumber(phoneNumber) {
   return /^(0[3-9])[0-9]{8}$/.test(String(phoneNumber || ''));
 }
 
-const USER_PHONE_SCAN_ATTRIBUTES = {
-  '#userId': 'userId',
-  '#phone_number': 'phone_number',
-  '#username': 'username'
-};
-
-const USER_LOGIN_SCAN_ATTRIBUTES = {
-  '#userId': 'userId',
-  '#username': 'username',
-  '#phone_number': 'phone_number',
-  '#password_hash': 'password_hash'
-};
-
-const USER_LOGIN_PROFILE_SCAN_ATTRIBUTES = {
-  '#userId': 'userId',
-  '#username': 'username',
-  '#phone_number': 'phone_number',
-  '#password_hash': 'password_hash',
-  '#email': 'email',
-  '#display_name': 'display_name',
-  '#avatar_url': 'avatar_url',
-  '#email_verified': 'email_verified',
-  '#phone_verified': 'phone_verified',
-  '#status': 'status',
-  '#created_at': 'created_at',
-  '#updated_at': 'updated_at'
-};
+function mapUserRow(row) {
+  if (!row) return null;
+  return {
+    userId: row.user_id,
+    id: row.id,
+    username: row.username,
+    password_hash: row.password_hash,
+    email: row.email,
+    phone_number: row.phone_number,
+    display_name: row.display_name,
+    avatar_url: row.avatar_url,
+    email_verified: !!row.email_verified,
+    phone_verified: !!row.phone_verified,
+    status: row.status,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
 
 async function findUserByPhone(phoneNumber) {
   const normalizedInputPhone = normalizePhoneNumber(phoneNumber);
   if (!normalizedInputPhone) return null;
 
-  let lastEvaluatedKey;
-  do {
-    const result = await ddbDocClient.send(new ScanCommand({
-      TableName: USERS_TABLE,
-      ProjectionExpression: '#userId, #phone_number, #username',
-      ExpressionAttributeNames: USER_PHONE_SCAN_ATTRIBUTES,
-      ExclusiveStartKey: lastEvaluatedKey,
-    }));
-
-    const matched = (result.Items || []).find((item) =>
-      normalizePhoneNumber(item.phone_number) === normalizedInputPhone
-    );
-
-    if (matched) return matched;
-    lastEvaluatedKey = result.LastEvaluatedKey;
-  } while (lastEvaluatedKey);
-
-  return null;
+  const [rows] = await pool.query('SELECT * FROM users');
+  const matched = rows.find((row) => normalizePhoneNumber(row.phone_number) === normalizedInputPhone);
+  return matched ? mapUserRow(matched) : null;
 }
 
 async function findUserByUsername(username) {
   const normalizedInputUsername = normalizeUsername(username);
   if (!normalizedInputUsername) return null;
 
-  let lastEvaluatedKey;
-  const matches = [];
-  do {
-    const result = await ddbDocClient.send(new ScanCommand({
-      TableName: USERS_TABLE,
-      ProjectionExpression: '#userId, #username, #phone_number, #password_hash',
-      ExpressionAttributeNames: USER_LOGIN_SCAN_ATTRIBUTES,
-      ExclusiveStartKey: lastEvaluatedKey,
-    }));
-
-    const matched = (result.Items || []).find((item) =>
-      normalizeUsername(item.username) === normalizedInputUsername
-    );
-
-    if (matched) matches.push(matched);
-    lastEvaluatedKey = result.LastEvaluatedKey;
-  } while (lastEvaluatedKey);
-
-  return matches.length > 0 ? matches[0] : null;
+  const [rows] = await pool.query('SELECT * FROM users');
+  const matched = rows.find((row) => normalizeUsername(row.username) === normalizedInputUsername);
+  return matched ? mapUserRow(matched) : null;
 }
 
 async function findUsersByUsername(username) {
   const normalizedInputUsername = normalizeUsername(username);
   if (!normalizedInputUsername) return [];
 
-  let lastEvaluatedKey;
-  const matches = [];
-  do {
-    const result = await ddbDocClient.send(new ScanCommand({
-      TableName: USERS_TABLE,
-      ProjectionExpression: '#userId, #username, #phone_number, #password_hash, #email, #display_name, #avatar_url, #email_verified, #phone_verified, #status, #created_at, #updated_at',
-      ExpressionAttributeNames: USER_LOGIN_PROFILE_SCAN_ATTRIBUTES,
-      ExclusiveStartKey: lastEvaluatedKey,
-    }));
-
-    for (const item of result.Items || []) {
-      if (normalizeUsername(item.username) === normalizedInputUsername) {
-        matches.push(item);
-      }
-    }
-
-    lastEvaluatedKey = result.LastEvaluatedKey;
-  } while (lastEvaluatedKey);
-
-  return matches;
+  const [rows] = await pool.query('SELECT * FROM users');
+  return rows
+    .filter((row) => normalizeUsername(row.username) === normalizedInputUsername)
+    .map(mapUserRow);
 }
 
 async function registerUser(payload) {
@@ -186,13 +127,28 @@ async function registerUser(payload) {
     email_verified: false,
     phone_verified: false,
     status: 'offline',
-    created_at: now
+    created_at: now,
   };
 
-  await ddbDocClient.send(new PutCommand({
-    TableName: USERS_TABLE,
-    Item: item
-  }));
+  await pool.query(
+    `INSERT INTO users
+      (user_id, id, username, password_hash, email, phone_number, display_name, avatar_url, email_verified, phone_verified, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      item.userId,
+      item.id,
+      item.username,
+      item.password_hash,
+      item.email,
+      item.phone_number,
+      item.display_name,
+      item.avatar_url,
+      item.email_verified ? 1 : 0,
+      item.phone_verified ? 1 : 0,
+      item.status,
+      item.created_at,
+    ]
+  );
 
   const { password_hash, ...userWithoutPassword } = item;
   return userWithoutPassword;
@@ -213,16 +169,6 @@ async function loginUser(payload) {
   // Thử tìm theo số điện thoại trước nếu chuỗi chứa toàn số
   if (/^\d+$/.test(identifier) && identifier.length >= 8) {
     userToAuth = await findUserByPhone(identifier);
-    if (userToAuth) {
-      // Re-fetch with password_hash because findUserByPhone projection might be limited
-      const fullUserRes = await ddbDocClient.send(new ScanCommand({
-        TableName: USERS_TABLE,
-        FilterExpression: '#userId = :uid',
-        ExpressionAttributeNames: { '#userId': 'userId' },
-        ExpressionAttributeValues: { ':uid': userToAuth.userId }
-      }));
-      userToAuth = fullUserRes.Items?.[0] || null;
-    }
   }
 
   // Nếu không tìm thấy theo SĐT, thử tìm theo username
@@ -248,5 +194,5 @@ async function loginUser(payload) {
 
 module.exports = {
   registerUser,
-  loginUser
+  loginUser,
 };

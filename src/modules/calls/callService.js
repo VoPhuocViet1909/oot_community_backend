@@ -8,8 +8,7 @@
  * No REST logic — request/response handling is in callController.
  */
 
-const { ddbDocClient } = require("../../config/awsConfig");
-const { GetCommand, QueryCommand } = require("@aws-sdk/lib-dynamodb");
+const { pool } = require("../../config/mysqlConfig");
 
 const callModel = require("./callModel");
 const callRepository = require("./callRepository");
@@ -26,9 +25,6 @@ const {
   TIMEOUTS,
 } = require("./call.constants");
 
-const GROUPS_TABLE = process.env.DDB_GROUPS_TABLE || "ott_groups";
-const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
-
 // ─── Provider Singleton ─────────────────────────────────────────────────────
 
 const agoraProvider = new AgoraProvider();
@@ -39,10 +35,10 @@ const agoraProvider = new AgoraProvider();
  * Resolve a conversation from the database to determine callMode and members.
  *
  * Strategy:
- * 1. Query ott_groups with conversationId as groupId (GetCommand).
- * 2. If found → group conversation. Members come from ott_group_members.
+ * 1. Look up conversationId as a group_id in groups_.
+ * 2. If found → group conversation. Members come from group_members.
  * 3. If not found → direct (DM) conversation. Members are derived from
- *    the "dm:userA:userB" convention (no DM table exists in DynamoDB).
+ *    the "dm:userA:userB" convention (no dedicated DM table exists).
  *
  * @param {string} conversationId
  * @returns {Promise<{ callMode: "direct"|"group", members: string[], groupType?: string }>}
@@ -54,24 +50,20 @@ async function resolveConversation(conversationId) {
 
   const cid = conversationId.trim();
 
-  // 1. Try looking up as a group in ott_groups
-  const groupRes = await ddbDocClient.send(
-    new GetCommand({
-      TableName: GROUPS_TABLE,
-      Key: { groupId: cid },
-    }),
+  // 1. Try looking up as a group in groups_
+  const [groupRows] = await pool.query(
+    "SELECT * FROM groups_ WHERE group_id = ? LIMIT 1",
+    [cid],
   );
+  const group = groupRows[0] || null;
 
-  if (groupRes.Item) {
-    // Group conversation — get members from ott_group_members
-    const membersRes = await ddbDocClient.send(
-      new QueryCommand({
-        TableName: MEMBERS_TABLE,
-        KeyConditionExpression: "groupId = :gid",
-        ExpressionAttributeValues: { ":gid": cid },
-      }),
+  if (group) {
+    // Group conversation — get members from group_members
+    const [memberRows] = await pool.query(
+      "SELECT user_id FROM group_members WHERE group_id = ?",
+      [cid],
     );
-    const members = (membersRes.Items || []).map((item) => String(item.userId));
+    const members = memberRows.map((row) => String(row.user_id));
     if (members.length === 0) {
       throw new CallError(
         "Conversation has no members",
@@ -82,7 +74,7 @@ async function resolveConversation(conversationId) {
     return {
       callMode: CALL_MODE.GROUP,
       members,
-      groupType: groupRes.Item.type || null,
+      groupType: group.type || null,
     };
   }
 
@@ -116,17 +108,12 @@ async function resolveConversation(conversationId) {
 async function isUserInGroupConversation(conversationId, userId) {
   if (!conversationId || !userId) return false;
 
-  const memberRes = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MEMBERS_TABLE,
-      Key: {
-        groupId: String(conversationId),
-        userId: String(userId),
-      },
-    }),
+  const [rows] = await pool.query(
+    "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1",
+    [String(conversationId), String(userId)],
   );
 
-  return !!memberRes.Item;
+  return rows.length > 0;
 }
 
 /**

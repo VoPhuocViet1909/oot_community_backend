@@ -8,12 +8,10 @@ const authMiddleware = require('../../common/middlewares/authMiddleware');
 const upload = multer({
 	storage: multer.memoryStorage(),
 	limits: {
-		fileSize: 5 * 1024 * 1024,
+		fileSize: 100 * 1024 * 1024,
 	},
 });
 
-router.post('/presigned-url', uploadController.getPresignedUploadUrl);
 router.post('/direct', authMiddleware, upload.single('file'), uploadController.uploadDirect);
-router.get('/view-url', authMiddleware, uploadController.getPresignedViewUrl);
 
 module.exports = router;

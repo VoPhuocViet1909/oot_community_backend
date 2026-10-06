@@ -1,9 +1,6 @@
 const fs = require("fs/promises");
 const path = require("path");
 
-const { ddbDocClient } = require("../../config/awsConfig");
-const { GetCommand } = require("@aws-sdk/lib-dynamodb");
-
 const tokenStorePath = path.join(process.cwd(), "tmp", "notification-tokens.json");
 
 let firebaseAdmin = null;
@@ -237,13 +234,8 @@ async function sendPushNotifications(message) {
 
   let senderName = `Người dùng ${message.senderId}`;
   try {
-    const result = await ddbDocClient.send(
-      new GetCommand({
-        TableName: process.env.DDB_USERS_TABLE || "ott_users",
-        Key: { userId: String(message.senderId) },
-      }),
-    );
-    const u = result.Item || {};
+    const { getUserById } = require("../users/userService");
+    const u = (await getUserById(message.senderId)) || {};
     senderName = u.display_name || u.username || senderName;
   } catch {
     // ignore sender enrichment failure

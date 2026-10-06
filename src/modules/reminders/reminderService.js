@@ -1,26 +1,9 @@
 const { randomUUID } = require("crypto");
-const {
-  CreateTableCommand,
-  DescribeTableCommand,
-  waitUntilTableExists,
-} = require("@aws-sdk/client-dynamodb");
-const {
-  DeleteCommand,
-  GetCommand,
-  PutCommand,
-  ScanCommand,
-  UpdateCommand,
-} = require("@aws-sdk/lib-dynamodb");
-
-const { dynamoClient, ddbDocClient } = require("../../config/awsConfig");
+const { pool } = require("../../config/mysqlConfig");
 const { saveMessage, enrichSenderInfo } = require("../messages/messageService");
 
-const REMINDERS_TABLE = process.env.DDB_REMINDERS_TABLE || "ott_reminders";
-const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
 const VALID_REPEAT = new Set(["none", "daily", "weekly", "monthly"]);
 const VALID_STATUS = new Set(["active", "completed", "cancelled"]);
-
-let ensureTablePromise = null;
 
 function toString(value) {
   return String(value ?? "").trim();
@@ -65,39 +48,29 @@ function buildReminderMessageContent(content, remindAt, repeat) {
   return `[Nhắc hẹn]\n${content}\nThời gian: ${formatReminderTime(remindAt)}\nLặp lại: ${repeatText}`;
 }
 
+/* ─── row <-> app object mapping ─────────────────────────────────────────── */
+
+function mapReminderRow(row) {
+  if (!row) return null;
+  return {
+    reminderId: row.reminder_id,
+    conversationId: row.conversation_id,
+    creatorId: row.creator_id,
+    content: row.content,
+    remindAt: row.remind_at,
+    repeat: row.repeat_rule,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    lastTriggeredAt: row.last_triggered_at,
+    messageId: row.message_id,
+  };
+}
+
+// The `reminders` table is provisioned at boot via schema.sql/initSchema.js;
+// kept as a no-op so existing callers (e.g. reminderScheduler) don't break.
 async function ensureRemindersTable() {
-  if (ensureTablePromise) return ensureTablePromise;
-
-  ensureTablePromise = (async () => {
-    try {
-      await dynamoClient.send(
-        new DescribeTableCommand({ TableName: REMINDERS_TABLE }),
-      );
-      return;
-    } catch (error) {
-      if (error.name !== "ResourceNotFoundException") {
-        throw error;
-      }
-    }
-
-    await dynamoClient.send(
-      new CreateTableCommand({
-        TableName: REMINDERS_TABLE,
-        AttributeDefinitions: [
-          { AttributeName: "reminderId", AttributeType: "S" },
-        ],
-        KeySchema: [{ AttributeName: "reminderId", KeyType: "HASH" }],
-        BillingMode: "PAY_PER_REQUEST",
-      }),
-    );
-    console.log(`[reminders] Creating DynamoDB table ${REMINDERS_TABLE}`);
-    await waitUntilTableExists(
-      { client: dynamoClient, maxWaitTime: 60 },
-      { TableName: REMINDERS_TABLE },
-    );
-  })();
-
-  return ensureTablePromise;
+  return Promise.resolve();
 }
 
 async function isConversationMember(conversationId, userId) {
@@ -111,14 +84,12 @@ async function isConversationMember(conversationId, userId) {
   }
 
   const groupId = cid.startsWith("channel:") ? cid.slice("channel:".length) : cid;
-  const result = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MEMBERS_TABLE,
-      Key: { groupId, userId: uid },
-    }),
+  const [rows] = await pool.query(
+    "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1",
+    [groupId, uid],
   );
 
-  return Boolean(result.Item);
+  return rows.length > 0;
 }
 
 async function createReminder({
@@ -128,8 +99,6 @@ async function createReminder({
   remindAt,
   repeat,
 }) {
-  await ensureRemindersTable();
-
   const cid = toString(conversationId);
   const uid = toString(creatorId);
   const reminderContent = toString(content);
@@ -182,33 +151,50 @@ async function createReminder({
 
   reminder.messageId = String(message.id);
 
-  await ddbDocClient.send(
-    new PutCommand({
-      TableName: REMINDERS_TABLE,
-      Item: reminder,
-    }),
+  await pool.query(
+    `INSERT INTO reminders
+      (reminder_id, conversation_id, creator_id, content, remind_at, repeat_rule, status, created_at, updated_at, last_triggered_at, message_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      reminder.reminderId,
+      reminder.conversationId,
+      reminder.creatorId,
+      reminder.content,
+      reminder.remindAt,
+      reminder.repeat,
+      reminder.status,
+      reminder.createdAt,
+      reminder.updatedAt,
+      reminder.lastTriggeredAt,
+      reminder.messageId,
+    ],
   );
 
   return { reminder, message };
 }
 
 async function listReminders({ userId, conversationId, status }) {
-  await ensureRemindersTable();
-
   const uid = toString(userId);
   const cid = toString(conversationId);
   const normalizedStatus = toString(status).toLowerCase();
 
-  const result = await ddbDocClient.send(
-    new ScanCommand({ TableName: REMINDERS_TABLE }),
-  );
+  const whereClauses = [];
+  const params = [];
+  if (cid) {
+    whereClauses.push("conversation_id = ?");
+    params.push(cid);
+  }
+  if (normalizedStatus && VALID_STATUS.has(normalizedStatus)) {
+    whereClauses.push("status = ?");
+    params.push(normalizedStatus);
+  }
+
+  const sql = `SELECT * FROM reminders${whereClauses.length ? ` WHERE ${whereClauses.join(" AND ")}` : ""}`;
+  const [dbRows] = await pool.query(sql, params);
 
   const rows = [];
-  for (const item of result.Items || []) {
-    if (cid && item.conversationId !== cid) continue;
-    if (normalizedStatus && VALID_STATUS.has(normalizedStatus) && item.status !== normalizedStatus) {
-      continue;
-    }
+  for (const dbRow of dbRows) {
+    const item = mapReminderRow(dbRow);
     if (!(await isConversationMember(item.conversationId, uid))) continue;
     rows.push(item);
   }
@@ -217,15 +203,11 @@ async function listReminders({ userId, conversationId, status }) {
 }
 
 async function getReminder(reminderId, userId) {
-  await ensureRemindersTable();
-
-  const result = await ddbDocClient.send(
-    new GetCommand({
-      TableName: REMINDERS_TABLE,
-      Key: { reminderId: toString(reminderId) },
-    }),
+  const [rows] = await pool.query(
+    "SELECT * FROM reminders WHERE reminder_id = ? LIMIT 1",
+    [toString(reminderId)],
   );
-  const reminder = result.Item || null;
+  const reminder = mapReminderRow(rows[0]);
   if (!reminder) return null;
 
   if (!(await isConversationMember(reminder.conversationId, userId))) {
@@ -238,8 +220,6 @@ async function getReminder(reminderId, userId) {
 }
 
 async function updateReminder(reminderId, userId, patch) {
-  await ensureRemindersTable();
-
   const existing = await getReminder(reminderId, userId);
   if (!existing) return null;
   if (String(existing.creatorId) !== String(userId)) {
@@ -267,11 +247,11 @@ async function updateReminder(reminderId, userId, patch) {
   }
   next.updatedAt = new Date().toISOString();
 
-  await ddbDocClient.send(
-    new PutCommand({
-      TableName: REMINDERS_TABLE,
-      Item: next,
-    }),
+  await pool.query(
+    `UPDATE reminders
+     SET content = ?, remind_at = ?, repeat_rule = ?, status = ?, updated_at = ?
+     WHERE reminder_id = ?`,
+    [next.content, next.remindAt, next.repeat, next.status, next.updatedAt, toString(reminderId)],
   );
 
   return next;
@@ -286,60 +266,29 @@ async function cancelReminder(reminderId, userId) {
     throw error;
   }
 
-  await ddbDocClient.send(
-    new UpdateCommand({
-      TableName: REMINDERS_TABLE,
-      Key: { reminderId: toString(reminderId) },
-      UpdateExpression: "SET #status = :status, updatedAt = :updatedAt",
-      ExpressionAttributeNames: { "#status": "status" },
-      ExpressionAttributeValues: {
-        ":status": "cancelled",
-        ":updatedAt": new Date().toISOString(),
-      },
-    }),
+  await pool.query(
+    "UPDATE reminders SET status = ?, updated_at = ? WHERE reminder_id = ?",
+    ["cancelled", new Date().toISOString(), toString(reminderId)],
   );
 
   return { ...existing, status: "cancelled" };
 }
 
 async function findDueReminders(now = new Date()) {
-  await ensureRemindersTable();
-
-  const result = await ddbDocClient.send(
-    new ScanCommand({
-      TableName: REMINDERS_TABLE,
-      FilterExpression: "#status = :active AND remindAt <= :now",
-      ExpressionAttributeNames: { "#status": "status" },
-      ExpressionAttributeValues: {
-        ":active": "active",
-        ":now": now.toISOString(),
-      },
-    }),
+  const [rows] = await pool.query(
+    "SELECT * FROM reminders WHERE status = ? AND remind_at <= ?",
+    ["active", now.toISOString()],
   );
 
-  return result.Items || [];
+  return rows.map(mapReminderRow);
 }
 
 async function markReminderFiring(reminderId) {
-  try {
-    await ddbDocClient.send(
-      new UpdateCommand({
-        TableName: REMINDERS_TABLE,
-        Key: { reminderId },
-        UpdateExpression: "SET #status = :firing, updatedAt = :updatedAt",
-        ConditionExpression: "#status = :active",
-        ExpressionAttributeNames: { "#status": "status" },
-        ExpressionAttributeValues: {
-          ":active": "active",
-          ":firing": "firing",
-          ":updatedAt": new Date().toISOString(),
-        },
-      }),
-    );
-    return true;
-  } catch {
-    return false;
-  }
+  const [result] = await pool.query(
+    "UPDATE reminders SET status = ?, updated_at = ? WHERE reminder_id = ? AND status = ?",
+    ["firing", new Date().toISOString(), toString(reminderId), "active"],
+  );
+  return result.affectedRows === 1;
 }
 
 function nextRepeatTime(reminder) {
@@ -361,37 +310,20 @@ async function completeTriggeredReminder(reminder) {
   const now = new Date().toISOString();
 
   if (nextRemindAt) {
-    await ddbDocClient.send(
-      new UpdateCommand({
-        TableName: REMINDERS_TABLE,
-        Key: { reminderId: reminder.reminderId },
-        UpdateExpression:
-          "SET #status = :active, remindAt = :remindAt, lastTriggeredAt = :triggeredAt, updatedAt = :updatedAt",
-        ExpressionAttributeNames: { "#status": "status" },
-        ExpressionAttributeValues: {
-          ":active": "active",
-          ":remindAt": nextRemindAt,
-          ":triggeredAt": now,
-          ":updatedAt": now,
-        },
-      }),
+    await pool.query(
+      `UPDATE reminders
+       SET status = ?, remind_at = ?, last_triggered_at = ?, updated_at = ?
+       WHERE reminder_id = ?`,
+      ["active", nextRemindAt, now, now, toString(reminder.reminderId)],
     );
     return;
   }
 
-  await ddbDocClient.send(
-    new UpdateCommand({
-      TableName: REMINDERS_TABLE,
-      Key: { reminderId: reminder.reminderId },
-      UpdateExpression:
-        "SET #status = :completed, lastTriggeredAt = :triggeredAt, updatedAt = :updatedAt",
-      ExpressionAttributeNames: { "#status": "status" },
-      ExpressionAttributeValues: {
-        ":completed": "completed",
-        ":triggeredAt": now,
-        ":updatedAt": now,
-      },
-    }),
+  await pool.query(
+    `UPDATE reminders
+     SET status = ?, last_triggered_at = ?, updated_at = ?
+     WHERE reminder_id = ?`,
+    ["completed", now, now, toString(reminder.reminderId)],
   );
 }
 
@@ -416,7 +348,6 @@ async function buildReminderDueMessage(reminder) {
 }
 
 module.exports = {
-  REMINDERS_TABLE,
   buildReminderMessageContent,
   buildReminderDueMessage,
   cancelReminder,

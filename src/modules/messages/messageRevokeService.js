@@ -1,7 +1,4 @@
-const { ddbDocClient } = require("../../config/awsConfig");
-const { GetCommand, PutCommand } = require("@aws-sdk/lib-dynamodb");
-
-const MESSAGES_TABLE = process.env.DDB_MESSAGES_TABLE || "ott_messages";
+const { pool } = require("../../config/mysqlConfig");
 
 /**
  * Revokes (deletes) a message within a conversation.
@@ -33,22 +30,20 @@ async function revokeMessage(conversationId, messageId, userId) {
 
   const normalizedMessageId = String(messageId);
 
-  // 1. Fetch the conversation document
-  const getRes = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MESSAGES_TABLE,
-      Key: { conversationId },
-    }),
+  // 1. Fetch the conversation row
+  const [rows] = await pool.query(
+    "SELECT messages FROM messages WHERE conversation_id = ? LIMIT 1",
+    [conversationId],
   );
 
-  if (!getRes.Item) {
+  if (!rows[0]) {
     const err = new Error(`Conversation "${conversationId}" not found`);
     err.code = "NOT_FOUND";
     throw err;
   }
 
-  const messages = Array.isArray(getRes.Item.messages)
-    ? getRes.Item.messages.slice()
+  const messages = Array.isArray(rows[0].messages)
+    ? rows[0].messages.slice()
     : [];
 
   // 2. Locate the target message
@@ -85,15 +80,12 @@ async function revokeMessage(conversationId, messageId, userId) {
     reactions: null,
   };
 
-  // 6. Persist the updated messages array back to DynamoDB
-  await ddbDocClient.send(
-    new PutCommand({
-      TableName: MESSAGES_TABLE,
-      Item: {
-        conversationId,
-        messages,
-      },
-    }),
+  // 6. Persist the updated messages array back to MySQL
+  await pool.query(
+    `INSERT INTO messages (conversation_id, messages, updated_at)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE messages = VALUES(messages), updated_at = VALUES(updated_at)`,
+    [conversationId, JSON.stringify(messages), new Date().toISOString()],
   );
 
   // 7. Auto-unpin the message if it was pinned in friendship or group
@@ -109,17 +101,10 @@ async function revokeMessage(conversationId, messageId, userId) {
           const isPinned = pinned.some(m => String(m.id) === normalizedMessageId);
           if (isPinned) {
             pinned = pinned.filter(m => String(m.id) !== normalizedMessageId);
-            const { UpdateCommand } = require("@aws-sdk/lib-dynamodb");
-            const FRIENDS_TABLE = process.env.DDB_FRIENDSHIPS_TABLE || "ott_friendships";
-            await ddbDocClient.send(new UpdateCommand({
-              TableName: FRIENDS_TABLE,
-              Key: { friendshipId: String(rec.friendshipId) },
-              UpdateExpression: 'SET pinnedMessages = :p, updated_at = :u',
-              ExpressionAttributeValues: {
-                ':p': pinned,
-                ':u': new Date().toISOString()
-              }
-            }));
+            await pool.query(
+              "UPDATE friendships SET pinned_messages = ?, updated_at = ? WHERE friendship_id = ?",
+              [JSON.stringify(pinned), new Date().toISOString(), String(rec.friendshipId)],
+            );
             updatedPinnedList = pinned;
           }
         }
@@ -130,24 +115,20 @@ async function revokeMessage(conversationId, messageId, userId) {
   } else {
     // Group chat
     try {
-      const GROUPS_TABLE = process.env.DDB_GROUPS_TABLE || "ott_groups";
-      const result = await ddbDocClient.send(new GetCommand({
-        TableName: GROUPS_TABLE,
-        Key: { groupId: String(conversationId) }
-      }));
-      const g = result.Item;
+      const [groupRows] = await pool.query(
+        "SELECT pinned_messages FROM groups_ WHERE group_id = ? LIMIT 1",
+        [String(conversationId)],
+      );
+      const g = groupRows[0];
       if (g) {
-        let pinned = Array.isArray(g.pinnedMessages) ? g.pinnedMessages : [];
+        let pinned = Array.isArray(g.pinned_messages) ? g.pinned_messages : [];
         const isPinned = pinned.some(m => String(m.id) === normalizedMessageId);
         if (isPinned) {
           pinned = pinned.filter(m => String(m.id) !== normalizedMessageId);
-          const { UpdateCommand } = require("@aws-sdk/lib-dynamodb");
-          await ddbDocClient.send(new UpdateCommand({
-            TableName: GROUPS_TABLE,
-            Key: { groupId: String(conversationId) },
-            UpdateExpression: 'SET pinnedMessages = :p',
-            ExpressionAttributeValues: { ':p': pinned }
-          }));
+          await pool.query(
+            "UPDATE groups_ SET pinned_messages = ?, updated_at = ? WHERE group_id = ?",
+            [JSON.stringify(pinned), new Date().toISOString(), String(conversationId)],
+          );
           updatedPinnedList = pinned;
         }
       }

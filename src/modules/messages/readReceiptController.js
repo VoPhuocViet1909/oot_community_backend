@@ -4,6 +4,7 @@
  */
 const readReceiptService = require("./readReceiptService");
 const messageService = require("./messageService");
+const { pool } = require("../../config/mysqlConfig");
 
 /**
  * Get read receipts for a specific message
@@ -221,21 +222,15 @@ async function getUserDisplayInfo(userId) {
     }
 
     // Fallback: get from users table directly
-    const { ddbDocClient } = require("../../config/awsConfig");
-    const { GetCommand } = require("@aws-sdk/lib-dynamodb");
-    const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
-
-    const result = await ddbDocClient.send(
-      new GetCommand({
-        TableName: USERS_TABLE,
-        Key: { userId: String(userId) },
-      })
+    const [rows] = await pool.query(
+      "SELECT display_name, username, avatar_url FROM users WHERE user_id = ? LIMIT 1",
+      [String(userId)],
     );
 
-    if (result.Item) {
+    if (rows[0]) {
       return {
-        displayName: result.Item.displayName || result.Item.name || result.Item.username || userId,
-        avatarUrl: result.Item.avatarUrl || result.Item.avatar || result.Item.avatar_url || null,
+        displayName: rows[0].display_name || rows[0].username || userId,
+        avatarUrl: rows[0].avatar_url || null,
       };
     }
 
